@@ -41,3 +41,14 @@ select,input{width:100%;min-height:44px;padding:.6rem;border:1px solid #8397a3;b
 .status-text{color:var(--wine)}
 @media(max-width:850px){.catalog-controls{grid-template-columns:1fr 1fr}.item-layout{grid-template-columns:1fr}.item-copy{position:static}.gallery-image img{height:auto;max-height:520px}}
 @media(max-width:600px){.catalog-controls,.form-row{grid-template-columns:1fr}.cart-line{align-items:flex-start;flex-direction:column}.cart-line-controls{width:100%}.cart-line-controls input{flex:1}.delivery-card,.totals{padding:1rem}}
+
+/* Storefront surfaces inherit the pink-led brand system. */
+select:focus-visible{outline-color:var(--focus)}
+.cart-count{background:linear-gradient(135deg,var(--rose),var(--plum))}
+.catalog-controls,.item-copy,.cart-line,.delivery-card,.totals{background:var(--surface);border-color:var(--line)}
+select,input{border-color:#bd829d;background:#fffafd;color:var(--ink)}
+.pagination[hidden]{display:none}
+.pagination button,.cart-line-controls button,.item-views button{border-color:#c98aa8;background:linear-gradient(105deg,#fffafd 0%,#f7e0eb 55%,#f9e7e8 100%);color:var(--wine)}
+.pagination button:hover:not(:disabled),.cart-line-controls button:hover:not(:disabled),.item-views button:hover:not(:disabled){background:linear-gradient(105deg,#fae6f0 0%,#f0d3e1 55%,#f3dcdf 100%)}
+.item-primary-image{background:var(--surface-strong)}
+.availability,.status-text{color:var(--rose)!important}

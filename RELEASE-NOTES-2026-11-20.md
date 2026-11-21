@@ -6,7 +6,7 @@
 - Reconciled the verified `art-001` through `art-009` public baseline (nine artworks and twelve legacy public photos) without publishing the imported private drafts.
 - Replaced the static public catalog path with a narrow Worker service binding to published data and added dynamic gallery, artwork, cart, quote, and checkout-status interfaces.
 - Added the protected, single-page administrator workspace for paginated artwork editing, independent draft saves, authenticated preview, explicit publication, archive/restore, store order, settings, and orders.
-- Added private JPEG/PNG/WebP processing with content and dimension checks, metadata-stripping WebP derivatives, a four-photo limit, private draft delivery, and publication-gated public delivery. HEIC/HEIF is intentionally unsupported.
+- Added private JPEG/PNG/WebP/HEIC/HEIF processing with content and dimension checks, metadata-stripping WebP derivatives, a four-photo limit, private draft delivery, and publication-gated public delivery. Still-image HEIC/HEIF uploads are decoded and re-encoded to WebP; sequences and unrelated ISO media remain unsupported.
 - Added provider-neutral shipping, tax, quote, reservation, order, webhook, and hosted-checkout interfaces. Payment initiation remains disabled until an owner-authorized provider and required business configuration are supplied and sandbox-verified.
 
 ## Additive migrations

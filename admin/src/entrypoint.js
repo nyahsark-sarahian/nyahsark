@@ -1,5 +1,6 @@
 import revisionedSchema from '../migrations/0003_revisioned_catalog.sql';
 import commandSchema from '../migrations/0004_settings_commands.sql';
+import complianceSchema from '../migrations/0005_listing_compliance.sql';
 import {makeVerifier} from './verifier.js';
 import {ensureSchema} from './schema.js';
 import {
@@ -31,6 +32,17 @@ import {
   updateTracking
 } from './commerce.js';
 import {sanitizeImage, MEDIA_LIMITS} from './media.js';
+import {aiAssistCapabilities, generateListingAssistance} from './ai-assist.js';
+import {getListingPriceGuidance} from './pricing-service.js';
+import {
+  POLICY_VERSION,
+  createPendingAssessment,
+  getActiveAssessment,
+  runDeterministicAssessment,
+  saveAssessment,
+  saveAiSuggestion,
+  saveHumanReview
+} from './compliance.js';
 import {HttpError, json, noStoreHeaders, publicJson, readJson, requireOrigin, routeError} from './http.js';
 
 const ADMIN_ASSETS = new Set([
@@ -64,7 +76,7 @@ async function ready(env) {
   if (!env.DB) throw Error('Database binding is unavailable');
   if (!initialized) {
     initialized = (async () => {
-      await ensureSchema(env.DB, revisionedSchema, commandSchema);
+      await ensureSchema(env.DB, revisionedSchema, commandSchema, complianceSchema);
       await reconcileBaseline(env.DB);
     })().catch((error) => {
       initialized = undefined;
@@ -171,7 +183,7 @@ async function readRequestBytes(request, maximum) {
   return output;
 }
 
-async function legacyPrivateMedia(media, env) {
+async function readLegacyPhoto(media, env) {
   if (!SAFE_LEGACY_PHOTO.test(media?.legacy_path || '')) throw new HttpError(404, 'Photo not found');
   const target = new URL(media.legacy_path, exactOrigin(env.STOREFRONT_ORIGIN, 'Storefront origin'));
   const response = await fetch(target, {headers: {Accept: 'image/jpeg'}, redirect: 'error'});
@@ -180,6 +192,11 @@ async function legacyPrivateMedia(media, env) {
   if (Number.isFinite(declared) && declared > MEDIA_LIMITS.inputBytes) throw new HttpError(404, 'Photo not found');
   const body = await response.arrayBuffer();
   if (!body.byteLength || body.byteLength > MEDIA_LIMITS.inputBytes) throw new HttpError(404, 'Photo not found');
+  return body;
+}
+
+async function legacyPrivateMedia(media, env) {
+  const body = await readLegacyPhoto(media, env);
   return new Response(body, {headers: {
     ...noStoreHeaders,
     'Content-Type': 'image/jpeg',
@@ -187,6 +204,85 @@ async function legacyPrivateMedia(media, env) {
     'Content-Security-Policy': "default-src 'none'; sandbox",
     'Cross-Origin-Resource-Policy': 'same-origin'
   }});
+}
+
+function requireCurrentVersion(body, artwork) {
+  if (!Number.isSafeInteger(body?.expected_version)) throw new HttpError(400, 'Expected version is required');
+  if (body.expected_version !== artwork.version) {
+    throw new HttpError(409, 'Draft changed in another session', {code: 'HEAD_CONFLICT', current_version: artwork.version});
+  }
+  if (artwork.state === 'archived') throw new HttpError(409, 'Restore this artwork before using Listing Copilot', {code: 'ARTWORK_ARCHIVED'});
+}
+
+async function sanitizedAssistanceImage(env, photo) {
+  const media = await getManagedMedia(env.DB, photo.asset_id, 'display');
+  if (media.body && media.content_type === 'image/webp') {
+    return {asset_id: photo.asset_id, bytes: new Uint8Array(media.body)};
+  }
+  const raw = await readLegacyPhoto(media, env);
+  const processed = await sanitizeImage(env.IMAGE_TRANSFORM, raw, 'image/jpeg', env.IMAGE_TRANSFORM_QUALIFIED);
+  const display = processed.objects.find((item) => item.role === 'display' && item.contentType === 'image/webp');
+  if (!display?.bytes) throw new HttpError(503, 'A sanitized display photo could not be prepared');
+  return {asset_id: photo.asset_id, bytes: display.bytes};
+}
+
+async function assistanceImages(env, artwork, allPhotos) {
+  const photos = Array.isArray(artwork.draft?.photos) ? artwork.draft.photos : [];
+  const main = photos.find((item) => item.is_main === true && item.asset_id);
+  if (!main) throw new HttpError(400, 'Save a main photo before using Listing Copilot', {fields: {photos: ['A saved main photo is required.']}});
+  const selected = allPhotos ? [main, ...photos.filter((item) => item.asset_id && item.asset_id !== main.asset_id)] : [main];
+  return Promise.all(selected.map((photo) => sanitizedAssistanceImage(env, photo)));
+}
+
+async function assertUnchangedArtwork(env, original) {
+  const current = await getAdminArtwork(env.DB, original.id);
+  if (current.version !== original.version || current.working_revision_id !== original.working_revision_id) {
+    throw new HttpError(409, 'Draft changed while Listing Copilot was working', {code: 'HEAD_CONFLICT', current_version: current.version});
+  }
+  return current;
+}
+
+async function assertSupportedActivePolicy(database) {
+  const active = await database.prepare(`SELECT id FROM catalog_policy_versions
+    WHERE status='active' ORDER BY activated_at DESC,id DESC LIMIT 1`).first();
+  if (active?.id !== POLICY_VERSION) {
+    throw new HttpError(503, 'Canonical listing review is unavailable during a policy update', {code: 'POLICY_VERSION_UNAVAILABLE'});
+  }
+}
+
+async function generateAndSaveAssistance(env, artwork, actor, {allPhotos = false} = {}) {
+  if (!aiAssistCapabilities(env).enabled) {
+    throw new HttpError(503, 'AI listing assistance is not configured', {code: 'AI_ASSIST_UNAVAILABLE'});
+  }
+  const images = await assistanceImages(env, artwork, allPhotos);
+  const results = await Promise.all(images.map((image) => generateListingAssistance(env, {
+    image,
+    draft: artwork.draft,
+    disclosures: artwork.draft.compliance
+  })));
+  await assertUnchangedArtwork(env, artwork);
+  const primary = results[0];
+  const suggestions = {
+    ...primary.suggestions,
+    alt_texts: results.flatMap((result) => result.suggestions.alt_texts)
+  };
+  const observations = results.flatMap((result, index) => result.observations.map((item) => ({...item, asset_id: images[index].asset_id})));
+  const uncertainties = [...new Set(results.flatMap((result) => result.uncertainties))];
+  const saved = await saveAiSuggestion(env.DB, {
+    artworkId: artwork.id,
+    revisionId: artwork.working_revision_id,
+    assetIds: images.map((image) => image.asset_id),
+    promptVersion: primary.prompt_version,
+    model: primary.model,
+    suggestions,
+    observations,
+    uncertainties
+  }, actor);
+  await assertUnchangedArtwork(env, artwork);
+  return {
+    assistance: {...primary, suggestions, observations, uncertainties},
+    saved
+  };
 }
 
 function adminListShape(result) {
@@ -261,7 +357,11 @@ async function adminApi(request, env, url) {
   const actor = `admin:${identity.subject}`;
 
   if (request.method === 'GET' && url.pathname === '/api/admin/capabilities') {
-    return json({media: mediaCapabilities(env.IMAGE_TRANSFORM_QUALIFIED)});
+    return json({
+      media: mediaCapabilities(env.IMAGE_TRANSFORM_QUALIFIED),
+      ai: aiAssistCapabilities(env),
+      compliance: {policy_version: POLICY_VERSION, deterministic_enforcement: true, human_review: true}
+    });
   }
   if (request.method === 'POST' && url.pathname === '/api/admin/capabilities/probe') {
     const type = (request.headers.get('content-type') || '').toLowerCase().split(';')[0].trim();
@@ -281,6 +381,125 @@ async function adminApi(request, env, url) {
   }
   const adminArtwork = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)$/);
   if (request.method === 'GET' && adminArtwork) return json({artwork: await getAdminArtwork(env.DB, adminArtwork)});
+  const assistDraft = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)\/assist\/draft-copy$/);
+  if (request.method === 'POST' && assistDraft) {
+    const body = await readJson(request, 32 * 1024);
+    const artwork = await getAdminArtwork(env.DB, assistDraft);
+    requireCurrentVersion(body, artwork);
+    const {assistance} = await generateAndSaveAssistance(env, artwork, actor, {allPhotos: true});
+    return json({
+      suggestion: {
+        ...assistance.suggestions,
+        observations: assistance.observations,
+        uncertainties: assistance.uncertainties
+      },
+      observations: assistance.observations,
+      uncertainties: assistance.uncertainties,
+      prompt_version: assistance.prompt_version,
+      message: 'Editable wording suggestions are ready. Nothing was saved to the listing or published.'
+    });
+  }
+  const assistPrice = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)\/assist\/price$/);
+  if (request.method === 'POST' && assistPrice) {
+    const body = await readJson(request, 32 * 1024);
+    const artwork = await getAdminArtwork(env.DB, assistPrice);
+    requireCurrentVersion(body, artwork);
+    const guidance = await getListingPriceGuidance(env.DB, {
+      artwork_id: artwork.id,
+      revision_id: artwork.working_revision_id,
+      seller_floor_cents: body.seller_floor_cents
+    });
+    await assertUnchangedArtwork(env, artwork);
+    return json({...guidance, message: 'Advisory price guidance is ready. No price was changed or published.'});
+  }
+  const assessCompliance = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)\/compliance\/assess$/);
+  if (request.method === 'POST' && assessCompliance) {
+    const body = await readJson(request, 32 * 1024);
+    const artwork = await getAdminArtwork(env.DB, assessCompliance);
+    requireCurrentVersion(body, artwork);
+    await assertSupportedActivePolicy(env.DB);
+    const capabilities = aiAssistCapabilities(env);
+    let observations = [];
+    let suggestion = null;
+    let model = null;
+    let promptVersion = null;
+    if (artwork.draft.offered_for_sale && capabilities.enabled) {
+      await createPendingAssessment(env.DB, {
+        artwork_id: artwork.id,
+        revision_id: artwork.working_revision_id,
+        policy_version: POLICY_VERSION,
+        source: 'ai_assisted'
+      }, actor);
+      try {
+        const {assistance} = await generateAndSaveAssistance(env, artwork, actor, {allPhotos: true});
+        observations = assistance.observations;
+        suggestion = {
+          ...assistance.suggestions,
+          observations: assistance.observations,
+          uncertainties: assistance.uncertainties
+        };
+        model = assistance.model;
+        promptVersion = assistance.prompt_version;
+      } catch (error) {
+        if (error?.details?.code !== 'HEAD_CONFLICT') {
+          await saveAssessment(env.DB, {
+            artwork_id: artwork.id,
+            revision_id: artwork.working_revision_id,
+            policy_version: POLICY_VERSION,
+            decision: 'error',
+            source: 'ai_assisted',
+            reason_codes: ['visual_analysis_unavailable'],
+            messages: ['Visual analysis could not be completed. Sale publication remains unavailable until a new assessment succeeds.'],
+            citations: []
+          }, actor);
+        }
+        throw error;
+      }
+    }
+    await assertSupportedActivePolicy(env.DB);
+    const assessment = await runDeterministicAssessment(env.DB, {
+      artwork_id: artwork.id,
+      revision_id: artwork.working_revision_id,
+      offered_for_sale: artwork.draft.offered_for_sale,
+      disclosures: artwork.draft.compliance,
+      observations,
+      source: model ? 'ai_assisted' : 'deterministic',
+      model_id: model,
+      prompt_version: promptVersion
+    }, actor);
+    await assertSupportedActivePolicy(env.DB);
+    await assertUnchangedArtwork(env, artwork);
+    return json({
+      assessment,
+      suggestion,
+      ai_observations_used: observations.length,
+      message: capabilities.enabled && artwork.draft.offered_for_sale
+        ? 'Canonical listing review completed using all saved photographs and seller disclosures.'
+        : 'Canonical listing review completed from the saved seller disclosures.'
+    });
+  }
+  const reviewCompliance = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)\/compliance\/review$/);
+  if (request.method === 'POST' && reviewCompliance) {
+    const body = await readJson(request, 32 * 1024);
+    const artwork = await getAdminArtwork(env.DB, reviewCompliance);
+    requireCurrentVersion(body, artwork);
+    const note = typeof body.note === 'string' ? body.note.trim() : '';
+    if (note.length < 8 || note.length > 2000) throw new HttpError(400, 'A review note of 8 to 2,000 characters is required');
+    if (!['approve', 'block', 'request_information'].includes(body.decision)) throw new HttpError(400, 'Review decision is invalid');
+    await assertSupportedActivePolicy(env.DB);
+    const current = await getActiveAssessment(env.DB, artwork.working_revision_id);
+    if (!current) throw new HttpError(409, 'Run canonical listing review before recording a human decision', {code: 'ASSESSMENT_REQUIRED'});
+    await assertUnchangedArtwork(env, artwork);
+    await assertSupportedActivePolicy(env.DB);
+    const assessment = await saveHumanReview(env.DB, {
+      assessment_id: current.id,
+      decision: body.decision,
+      note
+    }, actor);
+    await assertSupportedActivePolicy(env.DB);
+    await assertUnchangedArtwork(env, artwork);
+    return json({assessment, message: 'Human review decision recorded in the immutable audit history.'});
+  }
   const preview = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)\/preview$/);
   if (request.method === 'POST' && preview) {
     const body = await readJson(request);
@@ -305,7 +524,7 @@ async function adminApi(request, env, url) {
   if (request.method === 'POST' && url.pathname === '/api/admin/uploads') {
     if (env.IMAGE_TRANSFORM_QUALIFIED !== 'yes') throw new HttpError(503, 'Photo processing is not available');
     const body = await readJson(request, 32 * 1024);
-    if (!MEDIA_LIMITS.supportedMimeTypes.includes(body.content_type)) throw new HttpError(415, 'Supported photo types are JPEG, PNG, and WebP');
+    if (!MEDIA_LIMITS.supportedMimeTypes.includes(String(body.content_type || '').toLowerCase())) throw new HttpError(415, 'Supported photo types are JPEG, PNG, WebP, HEIC, and HEIF');
     if (!Number.isSafeInteger(body.byte_size) || body.byte_size < 1 || body.byte_size > MEDIA_LIMITS.inputBytes) {
       throw new HttpError(413, 'Photo must be no larger than 5 MiB');
     }

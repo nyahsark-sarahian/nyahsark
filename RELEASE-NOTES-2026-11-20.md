@@ -26,14 +26,17 @@ The runtime bootstrap is idempotent and verifies/repairs required schema objects
 - Production administrator: password/subject verification passed; the protected catalog returned the nine reconciled baseline artworks; Cloudflare Images qualification produced master/display/thumbnail WebP outputs; uploads are enabled.
 - Production private smoke: created and saved a private draft, uploaded a real JPEG, confirmed the saved photo after a fresh sign-in, then recoverably archived the draft without ever publishing it.
 - Provider sandbox: not run because no owner-authorized payment, tax, or shipping provider configuration is present.
-- Public deployment verification: pending the production build from this release commit.
+- Production public deployment: Cloudflare Workers Build `4e24b4e2-cff6-4906-99c6-101215ee4b95` completed successfully from source commit `5847b6f32af2c6ac447f967c780d833a043631c9`; dashboard version label `00a2b45b` is Ready at 100% traffic.
+- Production catalog verification: `/api/catalog` returned exactly the nine stable IDs `art-001` through `art-009` in the required order, with the verified copy, twelve public photographs, no duplicates, and no private smoke draft. All nine detail APIs and all twelve JPEGs returned successfully.
+- Production storefront verification: the homepage, clean artwork routes, cart, and storefront assets returned successfully. Browser checks at 390×844 touch and 1280×900 desktop rendered all nine cards without page errors or horizontal overflow.
+- Production boundary verification: public administrator and private-media paths returned 404; the anonymous administrator API returned 401 with private/no-store response controls.
 
 ## Deployment and rollback
 
 - Administrator Worker: `nyahsark-admin-staging`, active version `439cfae6-b838-47fc-a378-6f32edb7069d`.
 - Administrator rollback version: `ad155d13-be0e-4211-a5df-d7d8443a7636`.
 - Public Worker: `nyahsark`; pre-release rollback version `1d152705-8b1c-4a27-b93b-ab8cc84ab036`, source commit `12c036692092bbcbcd2bf927c9e4624d9048f1ff`.
-- Public release version/source/build: pending post-build verification.
+- Public release version label: `00a2b45b`; source commit: `5847b6f32af2c6ac447f967c780d833a043631c9`; Workers Build: `4e24b4e2-cff6-4906-99c6-101215ee4b95`.
 
 Administrator rollback is a 100% traffic deployment of the recorded prior version. Public rollback is either a 100% deployment of the recorded prior Worker version or a revert of `main` to the recorded source commit. Additive D1 tables and later data must be retained; rollback must not run destructive migrations.
 

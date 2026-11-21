@@ -19,5 +19,13 @@
   "vars": {
     "GALLERY_ORIGIN": "https://nyahsark.com",
     "CATALOG_PUBLIC_ORIGIN": "https://nyahsark.com"
+  },
+  "previews": {
+    "vars": {
+      // Accept the generated Preview hostname, but keep the Preview isolated
+      // from the live catalog service. API routes therefore fail closed.
+      "GALLERY_ORIGIN": "",
+      "CATALOG_PUBLIC_ORIGIN": "https://preview.invalid"
+    }
   }
 }

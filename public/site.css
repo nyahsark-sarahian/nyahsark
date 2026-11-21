@@ -12,3 +12,51 @@
 @keyframes ark-swing-front{0%,42%{opacity:1;transform:scaleY(-.38)}70%{opacity:1;transform:scaleY(0)}71%,100%{opacity:0;transform:scaleY(0)}}
 @keyframes ark-swing-back{0%,70%{opacity:0;transform:scaleY(0)}71%{opacity:1;transform:scaleY(0)}100%{opacity:1;transform:scaleY(1)}}
 @media(prefers-reduced-motion:reduce){.ark-boat,.ark-arc{animation:none;transform:none}.ark-arc-back{opacity:1}.ark-arc-front{display:none}}
+
+/* Pink-led Nyah's Ark palette, 2026-11-21. Deep rose and plum retain AA text contrast. */
+:root{--ink:#3a1d2d;--wine:#8b1e52;--gold:#c45486;--paper:#fff7fb;--muted:#6f5363;--line:#e4bfd0;--rose:#9b1b5a;--plum:#63295f;--red:#8e253c;--surface:#fff0f6;--surface-strong:#f6dbe7;--focus:#8a1d54;--brand-1:#a51664;--brand-2:#9c1b69;--brand-3:#90206c;--brand-4:#83256d;--brand-5:#74296a;--brand-6:#63295f;--brand-7:#732956;--brand-8:#84294f;--brand-9:#962c47}
+body{background:radial-gradient(circle at 12% 0,#fffdfd 0,transparent 34rem),var(--paper)}
+::selection{background:#efb8d1;color:#351524}
+a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,.gallery-views summary:focus-visible{outline-color:var(--focus)}
+.topline{background:linear-gradient(100deg,#7a1749 0%,#93245f 48%,#63295f 100%);color:#fff7fb}
+.header{background:rgba(255,247,251,.97);border-bottom-color:var(--line)}
+.brand-name,.wordmark{color:var(--rose)}
+.brand-name{font-weight:600}
+.brand-name>.brand-letter:nth-child(1){color:var(--brand-1)}
+.brand-name>.brand-letter:nth-child(2){color:var(--brand-2)}
+.brand-name>.brand-letter:nth-child(3){color:var(--brand-3)}
+.brand-name>.brand-letter:nth-child(4){color:var(--brand-4)}
+.brand-name>.brand-letter:nth-child(5){color:var(--brand-5)}
+.brand-name>.brand-letter:nth-child(6){color:var(--brand-6)}
+.brand-name>.brand-letter:nth-child(7){color:var(--brand-7)}
+.brand-name>.brand-letter:nth-child(8){color:var(--brand-8)}
+.brand-name>.brand-letter:nth-child(9){color:var(--brand-9)}
+.wordmark span{color:inherit;font-style:inherit}
+.wordmark:hover .brand-name{text-decoration:underline;text-decoration-color:#c45486;text-underline-offset:.22em}
+.eyebrow,.number,.gallery-copy .gallery-coming,.gallery-views summary{color:var(--rose)}
+.hero h1 em{color:var(--rose)}
+.button{background:linear-gradient(105deg,var(--brand-1) 0%,var(--brand-6) 55%,var(--brand-9) 100%);border-color:var(--brand-6);box-shadow:0 5px 14px rgba(99,41,95,.14);color:#fff}
+.button:hover{background:linear-gradient(105deg,#82104d 0%,#4b173d 55%,#782037 100%)}
+.button.light{background:linear-gradient(105deg,#fffafd 0%,#f7e0eb 55%,#f9e7e8 100%);box-shadow:none;color:var(--wine);border-color:#a64a75}
+.button.light:hover{background:linear-gradient(105deg,#fae6f0 0%,#f0d3e1 55%,#f3dcdf 100%)}
+.logo-panel{background:#fffafd;border-color:#dfb8c9;border-top:4px solid #cf4d89;box-shadow:14px 14px 0 #edcadb}
+.original-logo{filter:drop-shadow(0 8px 18px rgba(99,41,95,.08))}
+.card,.gallery-card{background:var(--surface);border-color:var(--line)}
+.gallery-image{background:var(--surface-strong)}
+.status{background:#fae5ef;border-left-color:#c45486}
+.quote{background:linear-gradient(145deg,#7a1749,#63295f);color:#fff7fb}
+.quote small,.quote .brand-name{color:#ffe5f1;-webkit-text-fill-color:currentColor}
+.quote .brand-name>.brand-letter:nth-child(1){color:#ffd0e5}
+.quote .brand-name>.brand-letter:nth-child(2){color:#f8bedb}
+.quote .brand-name>.brand-letter:nth-child(3){color:#efafd4}
+.quote .brand-name>.brand-letter:nth-child(4){color:#e2a9d0}
+.quote .brand-name>.brand-letter:nth-child(5){color:#d4afd3}
+.quote .brand-name>.brand-letter:nth-child(6){color:#c5b0d0}
+.quote .brand-name>.brand-letter:nth-child(7){color:#d8afc8}
+.quote .brand-name>.brand-letter:nth-child(8){color:#e6acc0}
+.quote .brand-name>.brand-letter:nth-child(9){color:#f0acb7}
+.contact{background:#f3d9e6}
+.footer{color:#765364}
+.footer .brand-name{font-weight:700}
+@media(max-width:760px){.art-panel{box-shadow:10px 10px 0 #edcadb}}
+@media(forced-colors:active){.brand-name,.brand-name>.brand-letter,.wordmark .brand-name{color:LinkText;-webkit-text-fill-color:currentColor}.button{box-shadow:none;forced-color-adjust:auto}}

@@ -7,6 +7,7 @@ const RESERVATION_TTL_SECONDS = 30 * 60;
 const ORDER_PAGE_SIZE = 20;
 
 const rows = async (statement) => (await statement.all()).results || [];
+const changes = (result) => Number(result?.meta?.changes ?? result?.changes ?? 0);
 const parseJson = (value, fallback = null) => {
   try { return value == null ? fallback : JSON.parse(value); } catch { return fallback; }
 };
@@ -14,6 +15,51 @@ const nowSeconds = (context = {}) => Number.isSafeInteger(context.now) ? context
 const uuid = () => crypto.randomUUID();
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const integer = (value, min = 0, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(value) && value >= min && value <= max;
+
+function saleCompliancePredicate(revisionExpression = 'r.id') {
+  return `EXISTS(
+    SELECT 1 FROM catalog_compliance_effective e
+    WHERE e.revision_id=${revisionExpression}
+      AND e.policy_version=(
+        SELECT p.id FROM catalog_policy_versions p WHERE p.status='active'
+        ORDER BY p.activated_at DESC,p.id DESC LIMIT 1
+      )
+      AND e.id=(
+        SELECT a2.id FROM catalog_compliance_assessments a2
+        WHERE a2.revision_id=${revisionExpression} AND a2.policy_version=e.policy_version
+        ORDER BY a2.created_at DESC,a2.rowid DESC LIMIT 1
+      )
+      AND e.effective_decision IN ('allow','human_approved')
+  )`;
+}
+
+async function saleComplianceAllowed(database, revisionIds) {
+  const ids = [...new Set((Array.isArray(revisionIds) ? revisionIds : [])
+    .filter((value) => typeof value === 'string' && value))];
+  if (!ids.length) return false;
+  const placeholders = ids.map(() => '?').join(',');
+  const row = await database.prepare(`SELECT count(DISTINCT r.id) AS allowed_count
+    FROM catalog_artwork_revisions r
+    WHERE r.id IN (${placeholders})
+      AND (r.offered_for_sale=0 OR ${saleCompliancePredicate('r.id')})`).bind(...ids).first();
+  return Number(row?.allowed_count ?? 0) === ids.length;
+}
+
+async function assertSaleCompliance(database, revisionIds) {
+  if (!(await saleComplianceAllowed(database, revisionIds))) {
+    throw new HttpError(409, 'Listing compliance changed; request a fresh total', {code: 'COMPLIANCE_CHANGED'});
+  }
+}
+
+async function orderRevisionIds(database, orderId) {
+  const lines = await rows(database.prepare('SELECT snapshot_json FROM catalog_order_lines WHERE order_id=? ORDER BY line_number').bind(orderId));
+  const revisionIds = lines.map((line) => parseJson(line.snapshot_json, {})?.revision_id);
+  return revisionIds.length && revisionIds.every((value) => typeof value === 'string' && value) ? revisionIds : [];
+}
+
+async function assertOrderSaleCompliance(database, orderId) {
+  await assertSaleCompliance(database, await orderRevisionIds(database, orderId));
+}
 
 function stableValue(value) {
   if (Array.isArray(value)) return value.map(stableValue);
@@ -372,6 +418,7 @@ async function loadMerchandise(database, requested) {
       snapshot
     });
   }
+  await assertSaleCompliance(database, lines.map((line) => line.revision_id));
   return {lines, merchandise_cents: merchandise};
 }
 
@@ -425,7 +472,11 @@ export async function createQuote(database, input, env = {}, context = {}) {
   const now = nowSeconds(context);
   const requestHash = await hash(input);
   const prior = await idempotentResponse(database, 'quote', idempotencyKey, requestHash, now);
-  if (prior) return prior;
+  if (prior) {
+    const record = await quoteRecord(database, prior.quote_id);
+    await assertSaleCompliance(database, record.lines.map((line) => line.revision_id));
+    return prior;
+  }
 
   const settings = await getSettings(database);
   const merchandise = await loadMerchandise(database, requested);
@@ -542,9 +593,16 @@ export async function createQuote(database, input, env = {}, context = {}) {
   try {
     await database.batch(statements);
   } catch (error) {
+    if (String(error).includes('COMPLIANCE_CHANGED')) {
+      throw new HttpError(409, 'Listing compliance changed; request a fresh total', {code: 'COMPLIANCE_CHANGED'});
+    }
     if (idempotencyKey && String(error).includes('UNIQUE')) {
       const concurrent = await idempotentResponse(database, 'quote', idempotencyKey, requestHash, now);
-      if (concurrent) return concurrent;
+      if (concurrent) {
+        const record = await quoteRecord(database, concurrent.quote_id);
+        await assertSaleCompliance(database, record.lines.map((line) => line.revision_id));
+        return concurrent;
+      }
     }
     throw error;
   }
@@ -562,6 +620,7 @@ async function assertQuoteCurrent(database, record, settings, now) {
   const {quote, lines} = record;
   if (quote.status !== 'ready' || quote.expires_at <= now) throw new HttpError(409, 'Quote expired; request a fresh total');
   if (quote.settings_version !== settings.version) throw new HttpError(409, 'Store settings changed; request a fresh total');
+  await assertSaleCompliance(database, lines.map((line) => line.revision_id));
   const version = await hash(lines.map((line) => ({
     revision_id: line.revision_id,
     content_hash: line.snapshot.content_hash,
@@ -577,7 +636,8 @@ async function assertQuoteCurrent(database, record, settings, now) {
        FROM catalog_artwork_heads h JOIN catalog_artwork_revisions r ON r.id=h.published_revision_id
        JOIN catalog_revision_configurations rc ON rc.revision_id=r.id AND rc.configuration_id=? AND rc.enabled=1
        JOIN catalog_inventory i ON i.artwork_id=h.artwork_id
-       WHERE h.artwork_id=? AND h.archived_at IS NULL AND h.published_revision_id=? AND r.offered_for_sale=1`
+       WHERE h.artwork_id=? AND h.archived_at IS NULL AND h.published_revision_id=? AND r.offered_for_sale=1
+         AND ${saleCompliancePredicate('r.id')}`
     ).bind(line.configuration_id, line.artwork_id, line.revision_id).first();
     if (!current || current.base_price_cents + current.price_add_on_cents !== line.unit_price_cents || current.inventory_version !== line.snapshot.inventory_version) throw new HttpError(409, 'Catalog changed; request a fresh total');
     totals.set(line.artwork_id, (totals.get(line.artwork_id) || 0) + line.quantity);
@@ -607,18 +667,92 @@ async function paymentSession(binding, payload) {
   return {...result, hosted_url: hostedUrl.href};
 }
 
-function checkoutReplay(row) {
-  const delivery = parseJson(row.delivery_json, {});
-  const checkoutUrl = typeof delivery.checkout_url === 'string' ? delivery.checkout_url : null;
+async function cancelPaymentSession(binding, payload) {
+  const result = await callJsonBinding(binding, 'https://payment.internal/sessions/cancel', payload, 'Hosted checkout cancellation');
+  if (result.cancelled !== true || result.session_id !== payload.session_id || result.order_id !== payload.order_id) {
+    throw new HttpError(503, 'Hosted checkout cancellation returned an invalid response');
+  }
+  return result;
+}
+
+async function checkoutReplay(database, row) {
+  const current = await database.prepare(`SELECT o.id,o.order_number,o.quote_id,o.payment_status,o.provider_reference,o.delivery_json,
+      p.status AS attempt_status,p.provider_session_id
+    FROM catalog_orders o
+    LEFT JOIN catalog_payment_attempts p ON p.id=(
+      SELECT p2.id FROM catalog_payment_attempts p2 WHERE p2.order_id=o.id ORDER BY p2.created_at,p2.id LIMIT 1
+    )
+    WHERE o.id=?`).bind(row.id).first();
+  if (!current) throw new HttpError(404, 'Payment order not found');
+  const delivery = parseJson(current.delivery_json, {});
+  const storedUrl = typeof delivery.checkout_url === 'string' ? delivery.checkout_url : null;
+  const eligible = current.payment_status === 'pending' && current.attempt_status === 'ready' &&
+    typeof current.provider_reference === 'string' && current.provider_reference &&
+    current.provider_reference === current.provider_session_id;
+  const checkoutUrl = eligible ? storedUrl : null;
+  if (storedUrl && !eligible) {
+    await database.prepare("UPDATE catalog_orders SET delivery_json=json_remove(delivery_json,'$.checkout_url'),updated_at=unixepoch() WHERE id=?").bind(current.id).run();
+  }
   return {
-    order_id: row.id,
-    order_number: row.order_number,
-    payment_status: row.payment_status,
-    provider_reference: row.provider_reference,
+    order_id: current.id,
+    order_number: current.order_number,
+    payment_status: current.payment_status,
+    provider_reference: current.provider_reference,
     checkout_url: checkoutUrl,
     hosted_url: checkoutUrl,
     idempotent: true
   };
+}
+
+async function withholdHostedSession(database, orderId, attemptId, providerSessionId, {cancelled = false, reason = 'payment_state_changed'} = {}) {
+  const current = await database.prepare(`SELECT o.payment_status,p.status AS attempt_status
+    FROM catalog_orders o JOIN catalog_payment_attempts p ON p.id=? AND p.order_id=o.id WHERE o.id=?`).bind(attemptId, orderId).first();
+  const statements = [];
+  if (cancelled && current?.payment_status === 'pending') {
+    const reservations = await rows(database.prepare("SELECT id FROM catalog_inventory_reservations WHERE order_id=? AND state='active' ORDER BY id").bind(orderId));
+    for (const reservation of reservations) statements.push(database.prepare(
+      "UPDATE catalog_inventory_reservations SET state='released',updated_at=unixepoch() WHERE id=? AND state='active'"
+    ).bind(reservation.id));
+    statements.push(database.prepare("UPDATE catalog_payment_attempts SET provider_session_id=coalesce(provider_session_id,?),status='failed',updated_at=unixepoch() WHERE id=? AND status<>'complete'").bind(providerSessionId, attemptId));
+    statements.push(database.prepare("UPDATE catalog_orders SET provider_reference=coalesce(provider_reference,?),payment_status='expired',delivery_json=json_remove(delivery_json,'$.checkout_url'),updated_at=unixepoch() WHERE id=? AND payment_status='pending'").bind(providerSessionId, orderId));
+  } else {
+    statements.push(database.prepare(`UPDATE catalog_payment_attempts
+      SET provider_session_id=coalesce(provider_session_id,?),
+          status=CASE WHEN ?=0 AND status<>'complete' THEN 'uncertain' ELSE status END,
+          updated_at=unixepoch()
+      WHERE id=?`).bind(providerSessionId, cancelled ? 1 : 0, attemptId));
+    statements.push(database.prepare(`UPDATE catalog_orders
+      SET provider_reference=coalesce(provider_reference,?),
+          payment_status=CASE WHEN ?=0 AND payment_status IN ('pending','authorized','failed','expired') THEN 'session_uncertain' ELSE payment_status END,
+          delivery_json=json_remove(delivery_json,'$.checkout_url'),updated_at=unixepoch()
+      WHERE id=?`).bind(providerSessionId, cancelled ? 1 : 0, orderId));
+  }
+  statements.push(database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'system:checkout','hosted_session_withheld',?)")
+    .bind(JSON.stringify({order_id: orderId, provider_session_id: providerSessionId, cancelled, reason, prior_payment_status: current?.payment_status || null, prior_attempt_status: current?.attempt_status || null})));
+  await database.batch(statements);
+}
+
+async function expireComplianceBlockedCheckout(database, orderId, details = {}) {
+  const reservations = await rows(database.prepare(
+    "SELECT id FROM catalog_inventory_reservations WHERE order_id=? AND state='active' ORDER BY id"
+  ).bind(orderId));
+  const statements = reservations.map((reservation) => database.prepare(
+    "UPDATE catalog_inventory_reservations SET state='released',updated_at=unixepoch() WHERE id=? AND state='active'"
+  ).bind(reservation.id));
+  statements.push(
+    database.prepare("UPDATE catalog_orders SET payment_status='expired',provider_reference=NULL,delivery_json=json_remove(delivery_json,'$.checkout_url'),updated_at=unixepoch() WHERE id=? AND payment_status IN ('pending','session_uncertain')").bind(orderId),
+    database.prepare("UPDATE catalog_payment_attempts SET status='failed',updated_at=unixepoch() WHERE order_id=? AND status IN ('creating','ready')").bind(orderId),
+    database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'system:compliance','compliance_checkout_blocked',?)")
+      .bind(JSON.stringify({order_id: orderId, ...details}))
+  );
+  await database.batch(statements);
+}
+
+async function markHostedSessionUncertain(database, orderId, attemptId, providerSessionId = null) {
+  await database.batch([
+    database.prepare("UPDATE catalog_payment_attempts SET provider_session_id=coalesce(provider_session_id,?),status='uncertain',updated_at=unixepoch() WHERE id=? AND status<>'complete'").bind(providerSessionId, attemptId),
+    database.prepare("UPDATE catalog_orders SET provider_reference=coalesce(provider_reference,?),payment_status='session_uncertain',delivery_json=json_remove(delivery_json,'$.checkout_url'),updated_at=unixepoch() WHERE id=?").bind(providerSessionId, orderId)
+  ]);
 }
 
 export async function beginCheckout(database, input, env = {}, context = {}) {
@@ -629,7 +763,8 @@ export async function beginCheckout(database, input, env = {}, context = {}) {
   const existing = await database.prepare('SELECT id,order_number,quote_id,payment_status,provider_reference,delivery_json FROM catalog_orders WHERE idempotency_key=?').bind(idempotencyKey).first();
   if (existing) {
     if (existing.quote_id !== quoteId) throw new HttpError(409, 'Idempotency key was reused with a different quote');
-    return checkoutReplay(existing);
+    await assertOrderSaleCompliance(database, existing.id);
+    return checkoutReplay(database, existing);
   }
   const settings = await getSettings(database);
   if (!paymentReady(settings, env)) throw new HttpError(503, 'Checkout not yet available');
@@ -677,34 +812,111 @@ export async function beginCheckout(database, input, env = {}, context = {}) {
       const concurrent = await database.prepare('SELECT id,order_number,quote_id,payment_status,provider_reference,delivery_json FROM catalog_orders WHERE idempotency_key=?').bind(idempotencyKey).first();
       if (concurrent) {
         if (concurrent.quote_id !== quoteId) throw new HttpError(409, 'Idempotency key was reused with a different quote');
-        return checkoutReplay(concurrent);
+        await assertOrderSaleCompliance(database, concurrent.id);
+        return checkoutReplay(database, concurrent);
       }
       const consumed = await database.prepare('SELECT id FROM catalog_orders WHERE quote_id=?').bind(quoteId).first();
       if (consumed) throw new HttpError(409, 'Quote was already consumed by another checkout');
     }
     if (String(error).includes('INSUFFICIENT_STOCK')) throw new HttpError(409, 'Inventory changed; request a fresh total');
+    if (String(error).includes('COMPLIANCE_CHANGED')) {
+      throw new HttpError(409, 'Listing compliance changed; request a fresh total', {code: 'COMPLIANCE_CHANGED'});
+    }
     throw error;
   }
   try {
-    const result = await paymentSession(env.PAYMENT_PROVIDER, {
+    await assertOrderSaleCompliance(database, orderId);
+  } catch (error) {
+    await expireComplianceBlockedCheckout(database, orderId);
+    throw error;
+  }
+  let result;
+  try {
+    result = await paymentSession(env.PAYMENT_PROVIDER, {
       order_id: orderId, order_number: orderNumber, quote_id: quote.id,
       amount_cents: quote.grand_total_cents, currency: 'USD', mode: settings.payment_mode,
       merchant_reference: settings.config.payment_merchant_reference,
       idempotency_key: idempotencyKey,
       return_reference: orderId
     });
-    await database.batch([
-      database.prepare("UPDATE catalog_payment_attempts SET provider_session_id=?,status='ready',updated_at=unixepoch() WHERE id=? AND status='creating'").bind(result.session_id, attemptId),
-      database.prepare("UPDATE catalog_orders SET provider_reference=?,delivery_json=json_set(delivery_json,'$.checkout_url',?),updated_at=unixepoch() WHERE id=?").bind(result.session_id, result.hosted_url, orderId)
-    ]);
-    return {order_id: orderId, order_number: orderNumber, payment_status: 'pending', checkout_url: result.hosted_url, hosted_url: result.hosted_url, provider_reference: result.session_id, idempotent: false};
   } catch {
-    await database.batch([
-      database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE id=?").bind(attemptId),
-      database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=?").bind(orderId)
-    ]);
+    await markHostedSessionUncertain(database, orderId, attemptId);
     throw new HttpError(503, 'Payment session outcome is uncertain; inventory remains reserved', {order_id: orderId});
   }
+  try {
+    await assertOrderSaleCompliance(database, orderId);
+    const finalized = await database.batch([
+      database.prepare(`UPDATE catalog_payment_attempts SET provider_session_id=?,status='ready',updated_at=unixepoch()
+        WHERE id=? AND status='creating' AND EXISTS(
+          SELECT 1 FROM catalog_orders o WHERE o.id=catalog_payment_attempts.order_id AND o.payment_status='pending'
+        )`).bind(result.session_id, attemptId),
+      database.prepare(`UPDATE catalog_orders SET provider_reference=?,delivery_json=json_set(delivery_json,'$.checkout_url',?),updated_at=unixepoch()
+        WHERE id=? AND payment_status='pending' AND EXISTS(
+          SELECT 1 FROM catalog_payment_attempts p
+          WHERE p.id=? AND p.order_id=catalog_orders.id AND p.status='ready' AND p.provider_session_id=?
+        )`).bind(result.session_id, result.hosted_url, orderId, attemptId, result.session_id)
+    ]);
+    const finalState = await database.prepare(`SELECT o.payment_status,o.provider_reference,o.delivery_json,p.status AS attempt_status,p.provider_session_id
+      FROM catalog_orders o JOIN catalog_payment_attempts p ON p.id=? AND p.order_id=o.id WHERE o.id=?`).bind(attemptId, orderId).first();
+    if (
+      changes(finalized[0]) !== 1 || changes(finalized[1]) !== 1 ||
+      finalState?.payment_status !== 'pending' || finalState?.attempt_status !== 'ready' ||
+      finalState?.provider_reference !== result.session_id || finalState?.provider_session_id !== result.session_id ||
+      parseJson(finalState?.delivery_json, {})?.checkout_url !== result.hosted_url
+    ) {
+      throw new HttpError(409, 'Payment state changed while hosted checkout was being created', {code: 'PAYMENT_STATE_CHANGED'});
+    }
+    await assertOrderSaleCompliance(database, orderId);
+  } catch (error) {
+    const complianceChanged = error?.details?.code === 'COMPLIANCE_CHANGED' || String(error?.message || error).includes('COMPLIANCE_CHANGED');
+    if (complianceChanged) {
+      let cancelled = false;
+      try {
+        await cancelPaymentSession(env.PAYMENT_PROVIDER, {
+          session_id: result.session_id,
+          order_id: orderId,
+          reason: 'listing_compliance_changed',
+          idempotency_key: `cancel:${attemptId}`
+        });
+        cancelled = true;
+      } catch {
+        cancelled = false;
+      }
+      if (cancelled) {
+        await expireComplianceBlockedCheckout(database, orderId, {provider_session_id: result.session_id, provider_cancelled: true});
+        throw new HttpError(409, 'Listing compliance changed; hosted checkout was cancelled', {code: 'COMPLIANCE_CHANGED'});
+      }
+      await markHostedSessionUncertain(database, orderId, attemptId, result.session_id);
+      throw new HttpError(503, 'Checkout was withheld because listing compliance changed; the payment session requires manual cancellation review', {
+        code: 'PAYMENT_SESSION_REVIEW', order_id: orderId
+      });
+    }
+    const paymentStateChanged = error?.details?.code === 'PAYMENT_STATE_CHANGED';
+    if (paymentStateChanged) {
+      let cancelled = false;
+      try {
+        await cancelPaymentSession(env.PAYMENT_PROVIDER, {
+          session_id: result.session_id,
+          order_id: orderId,
+          reason: 'payment_state_changed',
+          idempotency_key: `cancel:${attemptId}`
+        });
+        cancelled = true;
+      } catch {
+        cancelled = false;
+      }
+      await withholdHostedSession(database, orderId, attemptId, result.session_id, {cancelled, reason: 'payment_state_changed'});
+      if (cancelled) {
+        throw new HttpError(409, 'Payment state changed; hosted checkout was cancelled and withheld', {code: 'PAYMENT_STATE_CHANGED', order_id: orderId});
+      }
+      throw new HttpError(503, 'Payment state changed; hosted checkout was withheld for manual cancellation review', {
+        code: 'PAYMENT_SESSION_REVIEW', order_id: orderId
+      });
+    }
+    await markHostedSessionUncertain(database, orderId, attemptId, result.session_id);
+    throw new HttpError(503, 'Payment session finalization is uncertain; inventory remains reserved', {order_id: orderId});
+  }
+  return {order_id: orderId, order_number: orderNumber, payment_status: 'pending', checkout_url: result.hosted_url, hosted_url: result.hosted_url, provider_reference: result.session_id, idempotent: false};
 }
 
 function filteredWebhookHeaders(headers) {
@@ -733,6 +945,49 @@ async function verifiedWebhook(request, env) {
   return event;
 }
 
+async function recordComplianceRaceManualReview(database, event, order, context) {
+  const occurredAt = integer(event.occurred_at, 0) ? event.occurred_at : nowSeconds(context);
+  const statements = [
+    database.prepare(
+      'INSERT INTO catalog_payment_events(provider,provider_event_id,order_id,event_type,verified,payload_hash,occurred_at) VALUES(?,?,?,?,1,?,?)'
+    ).bind(event.provider, event.event_id, order.id, event.event_type, event.payload_hash, occurredAt),
+    database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=? AND payment_status IN ('pending','session_uncertain','authorized')").bind(order.id),
+    database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id),
+    database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','compliance_payment_manual_review',?)")
+      .bind(JSON.stringify({order_id: order.id, event_id: event.event_id, status: event.status, atomic_guard: true}))
+  ];
+  try {
+    await database.batch(statements);
+  } catch (error) {
+    if (String(error).includes('UNIQUE')) return {accepted: true, duplicate: true};
+    throw error;
+  }
+  return {accepted: true, duplicate: false, manual_review: true};
+}
+
+async function recordPaymentStateRaceManualReview(database, event, order, context) {
+  const occurredAt = integer(event.occurred_at, 0) ? event.occurred_at : nowSeconds(context);
+  const orderUpdate = event.status === 'refunded'
+    ? database.prepare("UPDATE catalog_orders SET payment_status='refunded',updated_at=unixepoch() WHERE id=? AND payment_status='paid'").bind(order.id)
+    : database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=? AND payment_status IN ('pending','session_uncertain','authorized','failed','expired')").bind(order.id);
+  const statements = [
+    database.prepare(
+      'INSERT INTO catalog_payment_events(provider,provider_event_id,order_id,event_type,verified,payload_hash,occurred_at) VALUES(?,?,?,?,1,?,?)'
+    ).bind(event.provider, event.event_id, order.id, event.event_type, event.payload_hash, occurredAt),
+    orderUpdate,
+    database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id),
+    database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','payment_state_race_manual_review',?)")
+      .bind(JSON.stringify({order_id: order.id, event_id: event.event_id, status: event.status, atomic_guard: true}))
+  ];
+  try {
+    await database.batch(statements);
+  } catch (error) {
+    if (String(error).includes('UNIQUE')) return {accepted: true, duplicate: true};
+    throw error;
+  }
+  return {accepted: true, duplicate: false, manual_review: true};
+}
+
 export async function handlePaymentWebhook(database, request, env = {}, context = {}) {
   const event = await verifiedWebhook(request, env);
   const duplicate = await database.prepare('SELECT provider_event_id FROM catalog_payment_events WHERE provider=? AND provider_event_id=?').bind(event.provider, event.event_id).first();
@@ -749,6 +1004,12 @@ export async function handlePaymentWebhook(database, request, env = {}, context 
     event.provider !== attempt.provider || event.provider !== paymentSnapshot.provider
   ) throw new HttpError(409, 'Payment event does not match the order');
   const reservations = await rows(database.prepare('SELECT id,state FROM catalog_inventory_reservations WHERE order_id=? ORDER BY id').bind(order.id));
+  const complianceAllowed = ['paid', 'authorized'].includes(event.status)
+    ? await saleComplianceAllowed(database, await orderRevisionIds(database, order.id))
+    : true;
+  const earlierRefund = event.status === 'paid' ? await database.prepare(`SELECT id FROM catalog_audit_events
+    WHERE action='early_refund_manual_review' AND json_extract(details_json,'$.order_id')=?
+    ORDER BY id DESC LIMIT 1`).bind(order.id).first() : null;
   const statements = [database.prepare(
     'INSERT INTO catalog_payment_events(provider,provider_event_id,order_id,event_type,verified,payload_hash,occurred_at) VALUES(?,?,?,?,1,?,?)'
   ).bind(event.provider, event.event_id, order.id, event.event_type, event.payload_hash, integer(event.occurred_at, 0) ? event.occurred_at : nowSeconds(context))];
@@ -756,18 +1017,32 @@ export async function handlePaymentWebhook(database, request, env = {}, context 
   const payableStates = ['pending','session_uncertain','authorized'];
   if (event.status === 'paid') {
     if (payableStates.includes(order.payment_status)) {
-      if (reservations.length && reservations.every((reservation) => reservation.state === 'active')) {
+      if (earlierRefund) {
+        manualReview = true;
+        statements.push(database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=?").bind(order.id));
+        statements.push(database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id));
+        statements.push(database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','payment_after_early_refund_manual_review',?)")
+          .bind(JSON.stringify({order_id:order.id,event_id:event.event_id})));
+      } else if (!complianceAllowed) {
+        manualReview = true;
+        statements.push(database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=?").bind(order.id));
+        statements.push(database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id));
+        statements.push(database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','compliance_payment_manual_review',?)")
+          .bind(JSON.stringify({order_id: order.id,event_id:event.event_id,status:event.status})));
+      } else if (reservations.length && reservations.every((reservation) => reservation.state === 'active')) {
         for (const reservation of reservations) statements.push(database.prepare("UPDATE catalog_inventory_reservations SET state='committed',updated_at=unixepoch() WHERE id=? AND state='active'").bind(reservation.id));
         statements.push(database.prepare("UPDATE catalog_orders SET payment_status='paid',updated_at=unixepoch() WHERE id=?").bind(order.id));
         statements.push(database.prepare("UPDATE catalog_payment_attempts SET status='complete',updated_at=unixepoch() WHERE order_id=?").bind(order.id));
       } else {
         manualReview = true;
         statements.push(database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=?").bind(order.id));
+        statements.push(database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id));
         statements.push(database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','late_payment_manual_review',?)").bind(JSON.stringify({order_id: order.id,event_id:event.event_id})));
       }
     } else if (['failed','expired'].includes(order.payment_status)) {
       manualReview = true;
       statements.push(database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=?").bind(order.id));
+      statements.push(database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id));
       statements.push(database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','late_payment_manual_review',?)").bind(JSON.stringify({order_id: order.id,event_id:event.event_id})));
     }
   } else if (['failed','expired'].includes(event.status)) {
@@ -777,9 +1052,27 @@ export async function handlePaymentWebhook(database, request, env = {}, context 
       statements.push(database.prepare("UPDATE catalog_payment_attempts SET status='failed',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id));
     }
   } else if (event.status === 'authorized') {
-    if (['pending','session_uncertain'].includes(order.payment_status)) statements.push(database.prepare("UPDATE catalog_orders SET payment_status='authorized',updated_at=unixepoch() WHERE id=?").bind(order.id));
+    if (['pending','session_uncertain'].includes(order.payment_status)) {
+      if (complianceAllowed) {
+        statements.push(database.prepare("UPDATE catalog_orders SET payment_status='authorized',updated_at=unixepoch() WHERE id=?").bind(order.id));
+      } else {
+        manualReview = true;
+        statements.push(database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=?").bind(order.id));
+        statements.push(database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id));
+        statements.push(database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','compliance_payment_manual_review',?)")
+          .bind(JSON.stringify({order_id: order.id,event_id:event.event_id,status:event.status})));
+      }
+    }
   } else if (event.status === 'refunded') {
-    if (order.payment_status === 'paid') statements.push(database.prepare("UPDATE catalog_orders SET payment_status='refunded',updated_at=unixepoch() WHERE id=?").bind(order.id));
+    if (order.payment_status === 'paid') {
+      statements.push(database.prepare("UPDATE catalog_orders SET payment_status='refunded',updated_at=unixepoch() WHERE id=?").bind(order.id));
+    } else if (['pending','session_uncertain','authorized','failed','expired'].includes(order.payment_status)) {
+      manualReview = true;
+      statements.push(database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=?").bind(order.id));
+      statements.push(database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id));
+      statements.push(database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','early_refund_manual_review',?)")
+        .bind(JSON.stringify({order_id:order.id,event_id:event.event_id,prior_status:order.payment_status})));
+    }
   } else {
     throw new HttpError(400, 'Payment event status is unsupported');
   }
@@ -787,6 +1080,12 @@ export async function handlePaymentWebhook(database, request, env = {}, context 
     await database.batch(statements);
   } catch (error) {
     if (String(error).includes('UNIQUE')) return {accepted: true, duplicate: true};
+    if (String(error).includes('COMPLIANCE_CHANGED') && ['paid','authorized'].includes(event.status)) {
+      return recordComplianceRaceManualReview(database, event, order, context);
+    }
+    if (String(error).includes('PAYMENT_STATE_CONFLICT')) {
+      return recordPaymentStateRaceManualReview(database, event, order, context);
+    }
     throw error;
   }
   return {accepted: true, duplicate: false, manual_review: manualReview};

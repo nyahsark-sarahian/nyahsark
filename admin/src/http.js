@@ -64,10 +64,14 @@ export function assertInteger(value, min, max, label) {
   return value;
 }
 
-export function assertText(value, max, label, {allowBlank = false} = {}) {
-  if (typeof value !== 'string' || value.length > max || (!allowBlank && !value.trim())) {
-    throw new HttpError(400, `${label} is invalid`);
+const UNSAFE_TEXT_CHARACTERS = /[\p{Cf}\p{Cs}]|[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u;
+
+export function assertText(value, max, label, {allowBlank = false, status = 400} = {}) {
+  if (typeof value !== 'string') throw new HttpError(status, `${label} is invalid`);
+  const normalized = value.normalize('NFKC');
+  if (normalized.length > max || UNSAFE_TEXT_CHARACTERS.test(normalized) || (!allowBlank && !normalized.trim())) {
+    throw new HttpError(status, `${label} is invalid`);
   }
-  return value;
+  return normalized;
 }
 

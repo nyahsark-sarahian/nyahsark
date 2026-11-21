@@ -8,8 +8,26 @@ export const MEDIA_LIMITS = Object.freeze({
   masterBytes: 1_800_000,
   displayBytes: 512 * 1024,
   thumbnailBytes: 192 * 1024,
-  supportedMimeTypes: ['image/jpeg', 'image/png', 'image/webp']
+  supportedMimeTypes: ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']
 });
+
+const HEIC_STILL_BRANDS = new Set(['heic', 'heix', 'heim', 'heis']);
+const HEIC_SEQUENCE_BRANDS = new Set(['hevc', 'hevx', 'hevm', 'hevs', 'msf1']);
+
+function fourCC(bytes, offset) {
+  if (offset < 0 || offset + 4 > bytes.length) return '';
+  return String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+}
+
+function heicType(bytes) {
+  if (bytes.length < 16 || fourCC(bytes, 4) !== 'ftyp') return null;
+  const size = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0, false);
+  if (size < 16 || size > bytes.length || size > 4096 || (size - 16) % 4 !== 0) return null;
+  const brands = [fourCC(bytes, 8)];
+  for (let offset = 16; offset < size; offset += 4) brands.push(fourCC(bytes, offset));
+  if (brands.some((brand) => HEIC_SEQUENCE_BRANDS.has(brand))) return null;
+  return brands.some((brand) => HEIC_STILL_BRANDS.has(brand)) ? {mime: 'image/heic', format: 'heic'} : null;
+}
 
 export function imageType(bytes) {
   if (!(bytes instanceof Uint8Array)) return null;
@@ -22,7 +40,12 @@ export function imageType(bytes) {
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
     return {mime: 'image/jpeg', format: 'jpeg'};
   }
-  return null;
+  return heicType(bytes);
+}
+
+function normalizedDeclaredType(value) {
+  const type = String(value || '').toLowerCase().split(';')[0].trim();
+  return type === 'image/heif' ? 'image/heic' : type;
 }
 
 async function readLimited(response, maximum) {
@@ -56,7 +79,7 @@ async function render(binding, raw, transform, quality, maximum) {
   const stream = () => new Blob([raw]).stream();
   const output = await binding
     .input(stream())
-    .transform({...transform, fit: 'scale-down'})
+    .transform({...transform, fit: 'scale-down', metadata: 'none'})
     .output({format: 'image/webp', quality});
   return readLimited(output.response(), maximum);
 }
@@ -68,8 +91,9 @@ export async function sanitizeImage(binding, rawInput, declaredType, qualified) 
   const raw = rawInput instanceof Uint8Array ? rawInput : new Uint8Array(rawInput || 0);
   if (!raw.length || raw.length > MEDIA_LIMITS.inputBytes) throw new HttpError(413, 'Photo must be no larger than 5 MiB');
   const sniffed = imageType(raw);
-  if (!sniffed || !MEDIA_LIMITS.supportedMimeTypes.includes(declaredType) || sniffed.mime !== declaredType) {
-    throw new HttpError(415, 'Supported photo types are JPEG, PNG, and WebP');
+  const suppliedType = String(declaredType || '').toLowerCase().split(';')[0].trim();
+  if (!sniffed || !MEDIA_LIMITS.supportedMimeTypes.includes(suppliedType) || sniffed.mime !== normalizedDeclaredType(suppliedType)) {
+    throw new HttpError(415, 'Supported photo types are JPEG, PNG, WebP, HEIC, and HEIF');
   }
 
   try {
@@ -77,8 +101,9 @@ export async function sanitizeImage(binding, rawInput, declaredType, qualified) 
     const reportedFormat = String(info?.format || '').toLowerCase();
     const bareFormat = reportedFormat.startsWith('image/') ? reportedFormat.slice('image/'.length) : reportedFormat;
     const format = bareFormat === 'jpg' ? 'jpeg' : bareFormat;
+    const decodedFormatMatches = sniffed.format === 'heic' ? ['heic', 'heif'].includes(format) : format === sniffed.format;
     if (
-      !['jpeg', 'png', 'webp'].includes(format) ||
+      !decodedFormatMatches ||
       !Number.isSafeInteger(info.width) ||
       !Number.isSafeInteger(info.height) ||
       info.width < 1 ||
@@ -123,7 +148,8 @@ export function mediaCapabilities(qualified) {
     max_pixels: MEDIA_LIMITS.maxPixels,
     max_side_pixels: MEDIA_LIMITS.maxSide,
     max_photos_per_artwork: MEDIA_LIMITS.maxPhotos,
-    heic_supported: false
+    heic_supported: qualified === 'yes',
+    heif_supported: qualified === 'yes'
   };
 }
 

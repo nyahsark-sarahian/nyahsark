@@ -11,7 +11,8 @@ const migrationNames = [
   '0001_legacy_inventory.sql',
   '0002_private_image_objects.sql',
   '0003_revisioned_catalog.sql',
-  '0004_settings_commands.sql'
+  '0004_settings_commands.sql',
+  '0005_listing_compliance.sql'
 ];
 const migrations = migrationNames.map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
 
@@ -76,7 +77,22 @@ const settingsPayload = (expectedVersion = 0, overrides = {}) => ({
   }]
 });
 
-function seedArtwork(sqlite, stock = 1) {
+function addComplianceAssessment(sqlite, {
+  artworkId = 'artwork-internal-0001',
+  revisionId = 'revision-published-0001',
+  decision = 'allow'
+} = {}) {
+  const sequence = Number(sqlite.prepare('SELECT count(*) AS n FROM catalog_compliance_assessments').get().n) + 1;
+  const id = `assessment-commerce-${String(sequence).padStart(4, '0')}`;
+  sqlite.prepare(`INSERT INTO catalog_compliance_assessments(
+    id,artwork_id,revision_id,policy_version,decision,source,reason_codes_json,messages_json,citations_json,actor
+  ) VALUES(?,?,?,'canonical-listing-v1',?,'deterministic','[]','[]','[]','test')`).run(
+    id, artworkId, revisionId, decision
+  );
+  return id;
+}
+
+function seedArtwork(sqlite, stock = 1, complianceDecision = 'allow') {
   const artworkId = 'artwork-internal-0001';
   const revisionId = 'revision-published-0001';
   const baseConfiguration = 'configuration-base-0001';
@@ -101,10 +117,11 @@ function seedArtwork(sqlite, stock = 1) {
   ).run(artworkId, revisionId, revisionId, revisionId);
   sqlite.prepare('INSERT INTO catalog_inventory(artwork_id,physical_stock) VALUES(?,?)').run(artworkId, stock);
   sqlite.prepare('INSERT INTO catalog_store_order(artwork_id,position) VALUES(?,0)').run(artworkId);
+  if (complianceDecision) addComplianceAssessment(sqlite, {artworkId, revisionId, decision: complianceDecision});
   return {artworkId, revisionId, baseConfiguration, frameConfiguration};
 }
 
-async function fixture({stock = 1, payment = true, packingStrategy = 'separate_packages'} = {}) {
+async function fixture({stock = 1, payment = true, packingStrategy = 'separate_packages', complianceDecision = 'allow'} = {}) {
   const state = d1();
   await saveSettings(state.DB, settingsPayload(), 'test');
   const config = {
@@ -115,7 +132,7 @@ async function fixture({stock = 1, payment = true, packingStrategy = 'separate_p
   state.sqlite.prepare(
     'UPDATE catalog_store_settings SET payment_status=?,payment_mode=?,config_json=? WHERE id=1'
   ).run(payment ? 'sandbox' : 'missing', payment ? 'sandbox' : 'disabled', JSON.stringify(config));
-  const catalog = seedArtwork(state.sqlite, stock);
+  const catalog = seedArtwork(state.sqlite, stock, complianceDecision);
   return {...state, ...catalog};
 }
 
@@ -132,7 +149,7 @@ const quoteRequest = (configurationId = 'configuration-base-0001', overrides = {
 });
 
 function providerEnvironment() {
-  const calls = {shipping: [], tax: [], sessions: [], verifies: []};
+  const calls = {shipping: [], tax: [], sessions: [], cancels: [], verifies: []};
   const environment = {
     PAYMENT_PROVIDER_NAME: 'testpay',
     SHIPPING_PROVIDER: {
@@ -172,6 +189,11 @@ function providerEnvironment() {
             mode: body.mode,
             merchant_reference: body.merchant_reference
           });
+        }
+        if (url.pathname === '/sessions/cancel') {
+          const body = await request.json();
+          calls.cancels.push(body);
+          return Response.json({cancelled: true, session_id: body.session_id, order_id: body.order_id});
         }
         const raw = await request.text();
         calls.verifies.push({headers: Object.fromEntries(request.headers), raw});
@@ -280,6 +302,59 @@ test('an incomplete provider-neutral quote persists null unresolved totals and c
   assert.deepEqual(JSON.parse(persisted.address_json), address());
 });
 
+test('sale quotes fail closed when a published revision has no active-policy assessment', async () => {
+  const state = await fixture({complianceDecision: null});
+  const {environment} = providerEnvironment();
+  await assert.rejects(
+    () => readyQuote(state, environment),
+    (error) => error.status === 409 && error.details?.code === 'COMPLIANCE_CHANGED'
+  );
+  assert.equal(state.sqlite.prepare('SELECT count(*) AS n FROM catalog_quotes').get().n, 0);
+});
+
+test('a newer pending assessment invalidates new quotes, idempotent replays, and checkout reservations', async () => {
+  const state = await fixture();
+  const {environment} = providerEnvironment();
+  const request = quoteRequest('configuration-base-0001', {idempotency_key: 'quote-compliance-0001'});
+  const quote = await createQuote(state.DB, request, environment, {now: 1_795_176_000});
+  addComplianceAssessment(state.sqlite, {decision: 'pending'});
+
+  await assert.rejects(
+    () => createQuote(state.DB, request, environment, {now: 1_795_176_010}),
+    (error) => error.status === 409 && error.details?.code === 'COMPLIANCE_CHANGED'
+  );
+  await assert.rejects(
+    () => createQuote(state.DB, quoteRequest('configuration-base-0001', {idempotency_key: 'quote-compliance-0002'}), environment, {now: 1_795_176_010}),
+    (error) => error.status === 409 && error.details?.code === 'COMPLIANCE_CHANGED'
+  );
+  await assert.rejects(
+    () => beginCheckout(state.DB, {quote_id: quote.quote_id, idempotency_key: 'checkout-compliance-0001'}, environment, {now: 1_795_176_100}),
+    (error) => error.status === 409 && error.details?.code === 'COMPLIANCE_CHANGED'
+  );
+  assert.equal(state.sqlite.prepare('SELECT count(*) AS n FROM catalog_orders').get().n, 0);
+  assert.equal(state.sqlite.prepare('SELECT count(*) AS n FROM catalog_inventory_reservations').get().n, 0);
+});
+
+test('concurrent idempotent quote recovery rechecks the active compliance assessment', async () => {
+  const state = await fixture();
+  const {environment} = providerEnvironment();
+  const originalBatch=state.DB.batch.bind(state.DB);
+  let injected=false;
+  state.DB.batch=async (statements) => {
+    const result=await originalBatch(statements);
+    if(!injected){
+      injected=true;
+      addComplianceAssessment(state.sqlite,{decision:'block'});
+      throw new Error('UNIQUE constraint failed: simulated concurrent idempotency insert');
+    }
+    return result;
+  };
+  await assert.rejects(
+    () => createQuote(state.DB,quoteRequest('configuration-base-0001',{idempotency_key:'quote-race-recheck-0001'}),environment,{now:1_795_176_000}),
+    (error) => error.status===409 && error.details?.code==='COMPLIANCE_CHANGED'
+  );
+});
+
 test('ready quotes use exact provider totals, taxable shipping/handling, idempotency, and settings invalidation', async () => {
   const state = await fixture();
   const {environment, calls} = providerEnvironment();
@@ -378,6 +453,136 @@ test('checkout is idempotent, aggregates reservations, and never trusts a provid
   }, environment), (error) => error.status === 409);
 });
 
+test('a compliance hold created during hosted-session creation cancels and withholds checkout', async () => {
+  const state = await fixture();
+  const {environment,calls} = providerEnvironment();
+  const originalFetch = environment.PAYMENT_PROVIDER.fetch.bind(environment.PAYMENT_PROVIDER);
+  environment.PAYMENT_PROVIDER.fetch = async (request) => {
+    if (new URL(request.url).pathname === '/sessions') addComplianceAssessment(state.sqlite,{decision:'block'});
+    return originalFetch(request);
+  };
+  const quote = await readyQuote(state,environment);
+  await assert.rejects(() => beginCheckout(state.DB,{
+    quote_id: quote.quote_id,
+    idempotency_key: 'checkout-compliance-race-0001'
+  },environment,{now:1_795_176_100}),
+  (error) => error.status===409 && error.details?.code==='COMPLIANCE_CHANGED');
+  assert.equal(calls.sessions.length,1);
+  assert.equal(calls.cancels.length,1);
+  assert.equal(calls.cancels[0].reason,'listing_compliance_changed');
+  assert.equal(state.sqlite.prepare('SELECT payment_status FROM catalog_orders').get().payment_status,'expired');
+  assert.equal(state.sqlite.prepare('SELECT status FROM catalog_payment_attempts').get().status,'failed');
+  assert.equal(state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations').get().state,'released');
+  const delivery=JSON.parse(state.sqlite.prepare('SELECT delivery_json FROM catalog_orders').get().delivery_json);
+  assert.equal(delivery.checkout_url,undefined);
+});
+
+test('an unconfirmed compliance-race cancellation withholds the URL and keeps inventory reserved for review', async () => {
+  const state = await fixture();
+  const {environment} = providerEnvironment();
+  const originalFetch = environment.PAYMENT_PROVIDER.fetch.bind(environment.PAYMENT_PROVIDER);
+  environment.PAYMENT_PROVIDER.fetch = async (request) => {
+    const path = new URL(request.url).pathname;
+    if (path === '/sessions') addComplianceAssessment(state.sqlite,{decision:'block'});
+    if (path === '/sessions/cancel') throw new Error('cancellation timeout');
+    return originalFetch(request);
+  };
+  const quote = await readyQuote(state,environment);
+  await assert.rejects(() => beginCheckout(state.DB,{
+    quote_id: quote.quote_id,
+    idempotency_key: 'checkout-cancel-uncertain-0001'
+  },environment,{now:1_795_176_100}),
+  (error) => error.status===503 && error.details?.code==='PAYMENT_SESSION_REVIEW');
+  assert.equal(state.sqlite.prepare('SELECT payment_status FROM catalog_orders').get().payment_status,'session_uncertain');
+  const attempt=state.sqlite.prepare('SELECT status,provider_session_id FROM catalog_payment_attempts').get();
+  assert.equal(attempt.status,'uncertain');
+  assert.match(attempt.provider_session_id,/^session-/);
+  assert.equal(state.sqlite.prepare('SELECT provider_reference FROM catalog_orders').get().provider_reference,attempt.provider_session_id);
+  assert.equal(state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations').get().state,'active');
+  const delivery=JSON.parse(state.sqlite.prepare('SELECT delivery_json FROM catalog_orders').get().delivery_json);
+  assert.equal(delivery.checkout_url,undefined);
+});
+
+test('a verified terminal webhook during hosted-session creation prevents URL finalization and replay', async () => {
+  const state = await fixture();
+  const {environment,calls} = providerEnvironment();
+  const originalFetch = environment.PAYMENT_PROVIDER.fetch.bind(environment.PAYMENT_PROVIDER);
+  environment.PAYMENT_PROVIDER.fetch = async (request) => {
+    if (new URL(request.url).pathname === '/sessions') {
+      const body = await request.clone().json();
+      environment.PAYMENT_PROVIDER.event = {
+        verified: true, provider: 'testpay', event_id: 'event-failed-during-session-0001',
+        order_id: body.order_id, event_type: 'payment.failed', status: 'failed',
+        amount_cents: body.amount_cents, currency: body.currency,
+        merchant_reference: body.merchant_reference, mode: body.mode, occurred_at: 1_795_176_101
+      };
+      await handlePaymentWebhook(state.DB, webhookRequest('failed-during-session'), environment, {now: 1_795_176_101});
+    }
+    return originalFetch(request);
+  };
+  const quote = await readyQuote(state, environment);
+  await assert.rejects(() => beginCheckout(state.DB, {
+    quote_id: quote.quote_id,
+    idempotency_key: 'checkout-failed-race-0001'
+  }, environment, {now: 1_795_176_100}),
+  (error) => error.status === 409 && error.details?.code === 'PAYMENT_STATE_CHANGED');
+  assert.equal(calls.sessions.length, 1);
+  assert.equal(calls.cancels.length, 1);
+  assert.equal(calls.cancels[0].reason, 'payment_state_changed');
+  const order = state.sqlite.prepare('SELECT id,payment_status,delivery_json FROM catalog_orders').get();
+  assert.equal(order.payment_status, 'failed');
+  assert.equal(state.sqlite.prepare('SELECT status FROM catalog_payment_attempts').get().status, 'failed');
+  assert.equal(state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations').get().state, 'released');
+  assert.equal(JSON.parse(order.delivery_json).checkout_url, undefined);
+
+  const replay = await beginCheckout(state.DB, {
+    quote_id: quote.quote_id,
+    idempotency_key: 'checkout-failed-race-0001'
+  }, environment, {now: 1_795_176_120});
+  assert.equal(replay.idempotent, true);
+  assert.equal(replay.payment_status, 'failed');
+  assert.equal(replay.checkout_url, null);
+  assert.equal(replay.hosted_url, null);
+  assert.equal(JSON.parse(state.sqlite.prepare('SELECT delivery_json FROM catalog_orders WHERE id=?').get(order.id).delivery_json).checkout_url, undefined);
+});
+
+test('an early refund during hosted-session creation remains manual review and never gains a URL', async () => {
+  const state = await fixture();
+  const {environment,calls} = providerEnvironment();
+  const originalFetch = environment.PAYMENT_PROVIDER.fetch.bind(environment.PAYMENT_PROVIDER);
+  environment.PAYMENT_PROVIDER.fetch = async (request) => {
+    if (new URL(request.url).pathname === '/sessions') {
+      const body = await request.clone().json();
+      environment.PAYMENT_PROVIDER.event = {
+        verified: true, provider: 'testpay', event_id: 'event-refund-during-session-0001',
+        order_id: body.order_id, event_type: 'payment.refunded', status: 'refunded',
+        amount_cents: body.amount_cents, currency: body.currency,
+        merchant_reference: body.merchant_reference, mode: body.mode, occurred_at: 1_795_176_101
+      };
+      await handlePaymentWebhook(state.DB, webhookRequest('refund-during-session'), environment, {now: 1_795_176_101});
+    }
+    return originalFetch(request);
+  };
+  const quote = await readyQuote(state, environment);
+  await assert.rejects(() => beginCheckout(state.DB, {
+    quote_id: quote.quote_id,
+    idempotency_key: 'checkout-refund-race-0001'
+  }, environment, {now: 1_795_176_100}),
+  (error) => error.status === 409 && error.details?.code === 'PAYMENT_STATE_CHANGED');
+  assert.equal(calls.cancels.length, 1);
+  const order = state.sqlite.prepare('SELECT payment_status,delivery_json FROM catalog_orders').get();
+  assert.equal(order.payment_status, 'session_uncertain');
+  assert.equal(state.sqlite.prepare('SELECT status FROM catalog_payment_attempts').get().status, 'uncertain');
+  assert.equal(state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations').get().state, 'active');
+  assert.equal(JSON.parse(order.delivery_json).checkout_url, undefined);
+  const replay = await beginCheckout(state.DB, {
+    quote_id: quote.quote_id,
+    idempotency_key: 'checkout-refund-race-0001'
+  }, environment, {now: 1_795_176_120});
+  assert.equal(replay.checkout_url, null);
+  assert.equal(replay.payment_status, 'session_uncertain');
+});
+
 test('verified payment webhooks commit once, deduplicate events, and support protected order/tracking views', async () => {
   const state = await fixture();
   const {environment} = providerEnvironment();
@@ -405,6 +610,154 @@ test('verified payment webhooks commit once, deduplicate events, and support pro
   assert.equal(tracked.tracking, 'TRACK-0001');
   assert.equal(tracked.fulfillment_status, 'unfulfilled');
   assert.equal((await getOrder(state.DB, checkout.order_id)).tracking, 'TRACK-0001');
+});
+
+test('concurrent paid and failed webhooks cannot diverge payment state from inventory', async () => {
+  async function scenario(executionOrder) {
+    const state=await fixture();
+    const {environment}=providerEnvironment();
+    const checkout=await checkedOut(state,environment);
+    const events={
+      'race-paid':paymentEvent(checkout,{event_id:`event-race-paid-${executionOrder.join('')}`}),
+      'race-failed':paymentEvent(checkout,{
+        event_id:`event-race-failed-${executionOrder.join('')}`,
+        event_type:'payment.failed',status:'failed'
+      })
+    };
+    const providerFetch=environment.PAYMENT_PROVIDER.fetch.bind(environment.PAYMENT_PROVIDER);
+    environment.PAYMENT_PROVIDER.fetch=async (request) => {
+      if(new URL(request.url).pathname==='/webhooks/verify'){
+        const input=JSON.parse(await request.text());
+        return Response.json(events[input.event_id]);
+      }
+      return providerFetch(request);
+    };
+    const originalBatch=state.DB.batch.bind(state.DB);
+    const queued=[];
+    let collecting=true;
+    state.DB.batch=(statements) => {
+      if(!collecting)return originalBatch(statements);
+      return new Promise((resolve,reject) => {
+        queued.push({statements,resolve,reject});
+        if(queued.length===2){
+          collecting=false;
+          queueMicrotask(async () => {
+            for(const index of executionOrder){
+              const entry=queued[index];
+              try{entry.resolve(await originalBatch(entry.statements));}
+              catch(error){entry.reject(error);}
+            }
+          });
+        }
+      });
+    };
+    const [paidResult,failedResult]=await Promise.all([
+      handlePaymentWebhook(state.DB,webhookRequest('race-paid'),environment),
+      handlePaymentWebhook(state.DB,webhookRequest('race-failed'),environment)
+    ]);
+    assert.equal(paidResult.accepted,true);
+    assert.equal(failedResult.accepted,true);
+    assert.equal(state.sqlite.prepare('SELECT count(*) AS n FROM catalog_payment_events').get().n,2);
+    assert.equal(state.sqlite.prepare("SELECT count(*) AS n FROM catalog_audit_events WHERE action='payment_state_race_manual_review'").get().n,1);
+    return {
+      order:state.sqlite.prepare('SELECT payment_status FROM catalog_orders').get().payment_status,
+      reservation:state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations').get().state,
+      inventory:{...state.sqlite.prepare('SELECT physical_stock,reserved_stock FROM catalog_inventory').get()},
+      attempt:state.sqlite.prepare('SELECT status FROM catalog_payment_attempts').get().status
+    };
+  }
+  const paidFirst=await scenario([0,1]);
+  assert.deepEqual(paidFirst,{order:'paid',reservation:'committed',inventory:{physical_stock:0,reserved_stock:0},attempt:'complete'});
+  const failedFirst=await scenario([1,0]);
+  assert.deepEqual(failedFirst,{order:'session_uncertain',reservation:'released',inventory:{physical_stock:1,reserved_stock:0},attempt:'uncertain'});
+});
+
+test('a verified refund delivered before paid is preserved for manual reconciliation', async () => {
+  const state=await fixture();
+  const {environment}=providerEnvironment();
+  const checkout=await checkedOut(state,environment);
+  environment.PAYMENT_PROVIDER.event=paymentEvent(checkout,{
+    event_id:'event-refund-before-paid-0001',event_type:'payment.refunded',status:'refunded'
+  });
+  const refund=await handlePaymentWebhook(state.DB,webhookRequest('refund-before-paid'),environment);
+  assert.equal(refund.manual_review,true);
+  assert.equal(state.sqlite.prepare('SELECT payment_status FROM catalog_orders').get().payment_status,'session_uncertain');
+  assert.equal(state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations').get().state,'active');
+  environment.PAYMENT_PROVIDER.event=paymentEvent(checkout,{
+    event_id:'event-paid-after-refund-0002',event_type:'payment.completed',status:'paid'
+  });
+  const paid=await handlePaymentWebhook(state.DB,webhookRequest('paid-after-refund'),environment);
+  assert.equal(paid.manual_review,true);
+  assert.equal(state.sqlite.prepare('SELECT payment_status FROM catalog_orders').get().payment_status,'session_uncertain');
+  assert.equal(state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations').get().state,'active');
+  assert.deepEqual({...state.sqlite.prepare('SELECT physical_stock,reserved_stock FROM catalog_inventory').get()},{physical_stock:1,reserved_stock:1});
+  assert.equal(state.sqlite.prepare('SELECT count(*) AS n FROM catalog_payment_events').get().n,2);
+  assert.equal(state.sqlite.prepare("SELECT count(*) AS n FROM catalog_audit_events WHERE action='early_refund_manual_review'").get().n,1);
+});
+
+test('a newer compliance block prevents payment from committing inventory and requires manual review', async () => {
+  const state = await fixture();
+  const {environment} = providerEnvironment();
+  const checkout = await checkedOut(state, environment);
+  addComplianceAssessment(state.sqlite, {decision: 'block'});
+  environment.PAYMENT_PROVIDER.event = paymentEvent(checkout, {event_id: 'event-compliance-block-0001'});
+
+  const result = await handlePaymentWebhook(state.DB, webhookRequest('compliance-block-paid'), environment, {now: 1_795_176_200});
+  assert.deepEqual(result, {accepted: true, duplicate: false, manual_review: true});
+  assert.deepEqual(
+    {...state.sqlite.prepare('SELECT physical_stock,reserved_stock FROM catalog_inventory').get()},
+    {physical_stock: 1, reserved_stock: 1}
+  );
+  assert.equal(state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations').get().state, 'active');
+  assert.equal(state.sqlite.prepare('SELECT payment_status FROM catalog_orders').get().payment_status, 'session_uncertain');
+  assert.equal(
+    state.sqlite.prepare("SELECT count(*) AS n FROM catalog_audit_events WHERE action='compliance_payment_manual_review'").get().n,
+    1
+  );
+});
+
+test('a newer compliance block also prevents an authorization transition', async () => {
+  const state = await fixture();
+  const {environment} = providerEnvironment();
+  const checkout = await checkedOut(state, environment);
+  addComplianceAssessment(state.sqlite, {decision: 'block'});
+  environment.PAYMENT_PROVIDER.event = paymentEvent(checkout, {
+    event_id: 'event-compliance-authorized-0001',
+    event_type: 'payment.authorized',
+    status: 'authorized'
+  });
+
+  const result = await handlePaymentWebhook(state.DB, webhookRequest('compliance-block-authorized'), environment);
+  assert.equal(result.manual_review, true);
+  assert.equal(state.sqlite.prepare('SELECT payment_status FROM catalog_orders').get().payment_status, 'session_uncertain');
+  assert.equal(state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations').get().state, 'active');
+});
+
+test('database guards atomically reject stale quote, checkout, reservation, and payment writes', async () => {
+  const state = await fixture();
+  const {environment} = providerEnvironment();
+  const checkout = await checkedOut(state, environment);
+  addComplianceAssessment(state.sqlite, {decision: 'block'});
+  assert.throws(() => state.sqlite.prepare(`INSERT INTO catalog_quote_lines(
+    quote_id,line_number,artwork_id,revision_id,configuration_id,quantity,unit_price_cents,line_total_cents,snapshot_json
+  ) VALUES(?,99,?,?,?,?,?,?,?)`).run(
+    checkout.quote.quote_id,state.artworkId,state.revisionId,state.baseConfiguration,1,10_000,10_000,
+    JSON.stringify({revision_id:state.revisionId})
+  ), /COMPLIANCE_CHANGED/);
+  assert.throws(() => state.sqlite.prepare(`INSERT INTO catalog_order_lines(
+    order_id,line_number,artwork_id,configuration_id,quantity,unit_price_cents,line_total_cents,snapshot_json
+  ) VALUES(?,99,?,?,?,?,?,?)`).run(
+    checkout.order_id,state.artworkId,state.baseConfiguration,1,10_000,10_000,
+    JSON.stringify({revision_id:state.revisionId})
+  ), /COMPLIANCE_CHANGED/);
+  assert.throws(() => state.sqlite.prepare("UPDATE catalog_inventory_reservations SET state='committed' WHERE order_id=?").run(checkout.order_id), /COMPLIANCE_CHANGED/);
+  assert.throws(() => state.sqlite.prepare("UPDATE catalog_orders SET payment_status='authorized' WHERE id=?").run(checkout.order_id), /COMPLIANCE_CHANGED/);
+  state.sqlite.prepare(`INSERT INTO catalog_payment_attempts(
+    id,order_id,provider,mode,status,idempotency_key
+  ) VALUES('attempt-race-guard-0001',?,'testpay','sandbox','creating','payment-race-guard-0001')`).run(checkout.order_id);
+  assert.throws(() => state.sqlite.prepare("UPDATE catalog_payment_attempts SET status='ready' WHERE id='attempt-race-guard-0001'").run(), /COMPLIANCE_CHANGED/);
+  assert.equal(state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations WHERE order_id=?').get(checkout.order_id).state, 'active');
+  assert.equal(state.sqlite.prepare('SELECT payment_status FROM catalog_orders WHERE id=?').get(checkout.order_id).payment_status, 'pending');
 });
 
 test('failed payment releases once and a later verified success is manual review without overselling', async () => {

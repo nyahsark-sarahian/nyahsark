@@ -1,4 +1,5 @@
 let readiness;
+let readinessLevel = 0;
 
 export function d1MigrationScript(sql) {
   if (typeof sql !== 'string') throw Error('Migration SQL is required');
@@ -11,7 +12,7 @@ export function d1MigrationScript(sql) {
     if (!current.length) trigger = /^CREATE\s+TRIGGER\b/i.test(line);
     current.push(line);
     const complete = trigger
-      ? (/^END;$/i.test(line) || (current.length === 1 && /\bBEGIN\b.*\bEND;\s*$/i.test(line)))
+      ? (/^END;$/i.test(line) || /\bBEGIN\b.*\bEND;\s*$/i.test(line))
       : /;\s*$/.test(line);
     if (complete) {
       statements.push(current.join(' '));
@@ -74,6 +75,28 @@ const commandObjects = {
   trigger: ['catalog_settings_guard','catalog_settings_apply'],
   index: []
 };
+const complianceObjects = {
+  table: [
+    'catalog_policy_versions','catalog_revision_disclosures','catalog_asset_observations',
+    'catalog_compliance_assessments','catalog_review_decisions','catalog_ai_suggestions'
+  ],
+  trigger: [
+    'catalog_disclosure_owner','catalog_disclosure_head_immutable_insert','catalog_disclosure_immutable_update',
+    'catalog_disclosure_immutable_delete','catalog_observation_owner','catalog_observation_immutable_update',
+    'catalog_observation_immutable_delete','catalog_assessment_owner','catalog_assessment_active_policy_guard','catalog_assessment_immutable_update',
+    'catalog_assessment_immutable_delete','catalog_review_approve_guard','catalog_review_active_policy_guard','catalog_review_latest_guard','catalog_review_immutable_update',
+    'catalog_review_immutable_delete','catalog_suggestion_owner','catalog_suggestion_immutable_update',
+    'catalog_suggestion_immutable_delete','catalog_compliance_publish_guard',
+    'catalog_quote_line_compliance_guard','catalog_order_line_compliance_guard',
+    'catalog_reservation_compliance_guard','catalog_order_payment_compliance_guard',
+    'catalog_payment_session_compliance_guard','catalog_order_payment_state_guard'
+  ],
+  index: [
+    'catalog_asset_observations_lookup','catalog_compliance_revision','catalog_compliance_artwork',
+    'catalog_review_assessment','catalog_ai_suggestions_revision'
+  ],
+  view: ['catalog_compliance_effective']
+};
 
 async function applyIfMissing(database, objects, sql) {
   if (await schemaReady(database, objects)) return;
@@ -89,13 +112,17 @@ async function applyIfMissing(database, objects, sql) {
   if (!(await schemaReady(database, objects))) throw Error('Catalog migration did not complete');
 }
 
-export function ensureSchema(database, revisionedSchema, commandSchema = '') {
-  if (!readiness) {
+export function ensureSchema(database, revisionedSchema, commandSchema = '', complianceSchema = '') {
+  const requestedLevel = complianceSchema.trim() ? 3 : commandSchema.trim() ? 2 : 1;
+  if (!readiness || readinessLevel < requestedLevel) {
+    readinessLevel = requestedLevel;
     readiness = (async () => {
       await applyIfMissing(database, coreObjects, revisionedSchema);
       await applyIfMissing(database, commandObjects, commandSchema);
+      if (complianceSchema.trim()) await applyIfMissing(database, complianceObjects, complianceSchema);
     })().catch((error) => {
       readiness = undefined;
+      readinessLevel = 0;
       throw error;
     });
   }
@@ -104,5 +131,6 @@ export function ensureSchema(database, revisionedSchema, commandSchema = '') {
 
 export function resetSchemaReadinessForTest() {
   readiness = undefined;
+  readinessLevel = 0;
 }
 

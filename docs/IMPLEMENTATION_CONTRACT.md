@@ -21,6 +21,18 @@ Every immutable revision stores a validated JSON snapshot with this shape:
     "intended_available_quantity": null,
     "captured_version": 0
   },
+  "compliance": {
+    "object_kind": "unknown",
+    "blessed_or_dedicated": "unknown",
+    "purported_relic": "unknown",
+    "relic_class_claim": null,
+    "contains_human_material": "unknown",
+    "provenance_known": "unknown",
+    "ecclesiastical_owner": "unknown",
+    "authenticity_document": "unknown",
+    "spiritual_benefit_priced": "unknown",
+    "seller_attested": false
+  },
   "photos": [
     {"asset_id": "uuid", "alt": "", "position": 0, "is_main": true}
   ],
@@ -36,7 +48,7 @@ Every immutable revision stores a validated JSON snapshot with this shape:
 }
 ```
 
-Drafts may be incomplete. A saved revision with photos must have one to four unique photo assets, contiguous positions, and exactly one main photo. Display publication requires a trimmed title and a valid main photo. Sale publication additionally requires a positive base price, positive eighth-inch dimensions, positive available inventory, and an enabled configuration linked to a valid packing profile.
+Drafts may be incomplete. A saved revision with photos must have one to four unique photo assets, contiguous positions, and exactly one main photo. Compliance answers are immutable revision data, not mutable profile data. Display publication requires a trimmed title and a valid main photo. Sale publication additionally requires a positive base price, positive eighth-inch dimensions, positive available inventory, an enabled configuration linked to a valid packing profile, and an effective `allow` or `human_approved` assessment under the active canonical-listing policy. A hard policy block cannot be human-approved.
 
 ## State
 
@@ -54,6 +66,10 @@ Archive clears public visibility while retaining heads, revisions, assets, inven
 - `POST /api/admin/artworks/:id/preview` validates a supplied draft and returns private no-store preview data.
 - `POST /api/admin/artworks/:id/publish` atomically switches the public revision, applies an intentional inventory adjustment with a captured inventory version, and inserts new public art into global order.
 - `POST /api/admin/artworks/:id/archive` and `/restore` are recoverable.
+- `POST /api/admin/artworks/:id/assist/draft-copy` returns editable copy and alt-text suggestions for the current saved revision. It does not save or publish them.
+- `POST /api/admin/artworks/:id/assist/price` returns advisory initial-price and listing-age guidance for the exact saved revision. It uses verified paid store orders, provider-created payment sessions as the qualified demand threshold, and ready quotes only as a weaker activity signal. It respects an optional seller floor and never writes a price.
+- `POST /api/admin/artworks/:id/compliance/assess` records a versioned policy assessment. AI may supply bounded visual observations; deterministic policy code alone decides `allow`, `review`, or `block`.
+- `POST /api/admin/artworks/:id/compliance/review` appends a human review decision and note. Reviews are auditable, and only a `review` assessment can be approved.
 - `POST /api/admin/store-order` accepts staged moves plus the expected global order version.
 - `POST /api/admin/uploads` allocates a private expiring upload. `PUT /api/admin/uploads/:id` fully decodes/reencodes supported input and atomically attaches the successful replacement through a new working revision.
 - `GET /api/admin/media/:assetId/:role` serves authenticated private media with no-store.
@@ -70,6 +86,10 @@ All admin routes require the exact configured Supabase subject, a verified passw
 - `POST /api/cart/quote` reloads catalog/configuration/inventory data and returns a server-owned expiring quote. Unresolved shipping or tax is `null`, never zero.
 - `POST /api/checkout` remains disabled unless store readiness and an authorized hosted-payment provider binding are both verified.
 
+The hosted-payment binding must create provider sessions through `/sessions`, cancel a just-created session idempotently through `/sessions/cancel`, and return a confirmed `{cancelled:true, session_id, order_id}` response. The application rechecks exact-revision compliance before and after recording the session. A database trigger prevents a session from becoming ready after a newer hold. If compliance changes during provider creation, the hosted URL is never returned; confirmed cancellation expires the order and releases its reservation, while an unconfirmed cancellation becomes `session_uncertain` for manual review. The production provider contract should use authorization-before-capture so a verified webhook can recheck compliance before capture.
+
+Payment-state transitions are database-guarded against reservation state: authorization requires active reservations, paid requires committed reservations, failed/expired requires released reservations, and refunded requires a previously paid order with committed reservations. Conflicting verified webhooks are retained in the event ledger and routed to manual review without downgrading paid/refunded state or making committed stock sellable. A refund observed before paid places the order in manual review and prevents a later paid event from auto-committing inventory.
+
 The storefront Worker exposes only this public surface through its service binding. It strips caller credentials and never forwards admin paths.
 
 ## Money, measurements, inventory, and order
@@ -82,9 +102,18 @@ The storefront Worker exposes only this public surface through its service bindi
 
 ## Media limits
 
-- Supported input: JPEG, PNG, WebP.
+- Supported input: JPEG, PNG, WebP, and still-image HEIC/HEIF. HEVC image sequences and unrelated ISO Base Media formats are rejected.
 - Maximum input: 5 MiB, 16 megapixels, 8192 px on either side.
 - At most four photos per revision.
-- Reencoded private master and display derivatives are stored; raw metadata-bearing uploads are not made public.
+- The production image-processing binding must identify and fully decode the claimed format before acceptance.
+- Reencoded private master, display, and thumbnail WebP derivatives are stored; raw metadata-bearing uploads are not made public.
 - Failed replacement leaves the prior working revision and image attached.
+
+## Listing Copilot boundary
+
+Listing Copilot is disabled unless its feature flag, Workers AI binding, and model are all configured. Only a sanitized display WebP and bounded saved-revision fields may reach the model. When AI Gateway is configured, request logging and caching are disabled for these calls.
+
+Model output is untrusted, schema-constrained input to the application. It may describe visible features and propose editable listing copy, but it cannot authenticate an object, establish blessing, provenance, ownership, relic status, age, material, authorship, canonical permission, civil legality, or spiritual effect. Photo-only concern can cause human review, never an automatic hard block. Policy assessments, reviews, citations, model observations, and suggestions are append-only and revision-bound.
+
+See [Listing Copilot policy](./LISTING_COPILOT_POLICY.md) for the decision boundary and source basis.
 

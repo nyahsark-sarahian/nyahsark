@@ -258,7 +258,7 @@ async function loadCatalog(page = 1) {
     nav.querySelector('[data-page-action="previous"]').disabled = catalogState.page <= 1;
     nav.querySelector('[data-page-action="next"]').disabled = catalogState.page >= catalogState.pages;
   } catch (error) {
-    status.textContent = `${error.message} Please contact Nyah's Ark if you need information about a piece.`;
+    status.textContent = `${error.message} Please contact us if you need information about a piece.`;
   }
 }
 

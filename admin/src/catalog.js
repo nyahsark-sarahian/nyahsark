@@ -1,6 +1,13 @@
 import {buildBaselineReconciliation} from './baseline.js';
-import {HttpError} from './http.js';
+import {HttpError, assertText} from './http.js';
 import {MEDIA_LIMITS, mediaCapabilities} from './media.js';
+import {
+  disclosureInsertStatement,
+  getActiveAssessment,
+  getLatestAiSuggestion,
+  normalizeDisclosures,
+  validateDisclosures
+} from './compliance.js';
 
 const ADMIN_PAGE_SIZE = 10;
 const PUBLIC_PAGE_SIZE = 24;
@@ -23,7 +30,7 @@ function databaseError(error, fallback = 'Catalog request failed') {
   const conflicts = [
     'REVISION_CONFLICT','REVISION_PARENT_CONFLICT','HEAD_CONFLICT','INVENTORY_CONFLICT','ORDER_CONFLICT',
     'ORDER_SET_MISMATCH','ORDER_DUPLICATE','ARTWORK_ARCHIVED','PHOTO_OWNER_MISMATCH','PHOTO_LIMIT',
-    'MAIN_PHOTO_REQUIRED','SALE_NOT_READY','TITLE_REQUIRED','UNIQUE constraint failed'
+    'MAIN_PHOTO_REQUIRED','SALE_NOT_READY','COMPLIANCE_REQUIRED','TITLE_REQUIRED','UNIQUE constraint failed'
   ];
   const code = conflicts.find((item) => message.includes(item));
   if (code) return new HttpError(409, code.replaceAll('_', ' ').toLowerCase(), {code});
@@ -44,13 +51,14 @@ function nullableInteger(value, min, max, fields, name) {
 export function validateDraftSnapshot(input) {
   const fields = {};
   const draft = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
-  const title = typeof draft.title === 'string' ? draft.title : '';
-  const description = typeof draft.description === 'string' ? draft.description : '';
-  if (title.length > 160) fieldError(fields, 'title', 'Use 160 characters or fewer.');
-  if (description.length > 10000) fieldError(fields, 'description', 'Use 10,000 characters or fewer.');
+  let title = typeof draft.title === 'string' ? draft.title : '';
+  let description = typeof draft.description === 'string' ? draft.description : '';
+  try { title = assertText(title, 160, 'Title', {allowBlank: true}); } catch { fieldError(fields, 'title', 'Use valid visible text of 160 characters or fewer.'); }
+  try { description = assertText(description, 10000, 'Description', {allowBlank: true}); } catch { fieldError(fields, 'description', 'Use valid visible text of 10,000 characters or fewer.'); }
   let category = draft.category === null || draft.category === undefined || draft.category === '' ? null : draft.category;
-  if (category !== null && (typeof category !== 'string' || !category.trim() || category.length > 100)) fieldError(fields, 'category', 'Choose a valid category.');
-  if (typeof category === 'string') category = category.trim();
+  if (category !== null) {
+    try { category = assertText(category, 100, 'Category').trim(); } catch { fieldError(fields, 'category', 'Choose a valid category.'); }
+  }
 
   const basePrice = nullableInteger(draft.base_price_cents, 0, 100000000, fields, 'base_price_cents');
   const width = nullableInteger(draft.width_eighths, 1, 1000000, fields, 'width_eighths');
@@ -78,8 +86,8 @@ export function validateDraftSnapshot(input) {
     photoIds.add(assetId);
     const position = photo?.position;
     if (!Number.isSafeInteger(position) || position !== index) fieldError(fields, `photos.${index}.position`, 'Photo positions must be consecutive.');
-    const alt = typeof photo?.alt === 'string' ? photo.alt : '';
-    if (alt.length > 500) fieldError(fields, `photos.${index}.alt`, 'Use 500 characters or fewer.');
+    let alt = typeof photo?.alt === 'string' ? photo.alt : '';
+    try { alt = assertText(alt, 500, 'Photo alt text', {allowBlank: true}); } catch { fieldError(fields, `photos.${index}.alt`, 'Use valid visible text of 500 characters or fewer.'); }
     return {asset_id: assetId, alt, position: index, is_main: photo?.is_main === true};
   });
   if (photos.length && photos.filter((photo) => photo.is_main).length !== 1) fieldError(fields, 'photos', 'Select exactly one main photo.');
@@ -91,13 +99,23 @@ export function validateDraftSnapshot(input) {
     const id = configuration?.id;
     if (typeof id !== 'string' || !idPattern.test(id) || configurationIds.has(id)) fieldError(fields, `configurations.${index}.id`, 'Configuration identifiers must be unique.');
     configurationIds.add(id);
-    const label = typeof configuration?.label === 'string' ? configuration.label.trim() : '';
-    if (!label || label.length > 160) fieldError(fields, `configurations.${index}.label`, 'Enter a label using 160 characters or fewer.');
+    let label = typeof configuration?.label === 'string' ? configuration.label : '';
+    try { label = assertText(label, 160, 'Configuration label').trim(); } catch { fieldError(fields, `configurations.${index}.label`, 'Enter valid visible text using 160 characters or fewer.'); }
     const addOn = nullableInteger(configuration?.price_add_on_cents, 0, 100000000, fields, `configurations.${index}.price_add_on_cents`);
     const packing = configuration?.packing_profile_id === null || configuration?.packing_profile_id === undefined || configuration?.packing_profile_id === '' ? null : configuration.packing_profile_id;
     if (packing !== null && (typeof packing !== 'string' || !idPattern.test(packing))) fieldError(fields, `configurations.${index}.packing_profile_id`, 'Choose a saved packing profile.');
     return {id, label, enabled: configuration?.enabled === true, price_add_on_cents: addOn ?? 0, packing_profile_id: packing, position: index};
   });
+
+  let compliance;
+  try {
+    compliance = validateDisclosures(draft.compliance);
+  } catch (error) {
+    if (!(error instanceof HttpError) || !error.details?.fields) throw error;
+    for (const [name, messages] of Object.entries(error.details.fields)) {
+      for (const message of messages) fieldError(fields, name, message);
+    }
+  }
 
   if (Object.keys(fields).length) throw new HttpError(400, 'Draft has validation errors', {fields});
   return {
@@ -111,7 +129,8 @@ export function validateDraftSnapshot(input) {
     requested_store_position: requestedPosition,
     inventory: {quantity_changed: quantityChanged, intended_available_quantity: intended, captured_version: captured},
     photos,
-    configurations
+    configurations,
+    compliance
   };
 }
 
@@ -135,8 +154,8 @@ function revisionInsert(database, {id, artworkId, number, parentId, importKey = 
   );
 }
 
-function childStatements(database, artworkId, revisionId, snapshot) {
-  const statements = [];
+function childStatements(database, artworkId, revisionId, snapshot, actor) {
+  const statements = [disclosureInsertStatement(database, revisionId, snapshot.compliance, actor)];
   for (const photo of snapshot.photos) {
     statements.push(database.prepare('INSERT INTO catalog_revision_photos(revision_id,asset_id,position,is_main,alt_text) VALUES(?,?,?,?,?)')
       .bind(revisionId, photo.asset_id, photo.position, photo.is_main ? 1 : 0, photo.alt));
@@ -171,8 +190,11 @@ async function resolveArtwork(database, identifier) {
   return row;
 }
 
-function assembleRevision(revision, photos, configurations, visibility) {
+function assembleRevision(revision, photos, configurations, disclosure, visibility) {
   const snapshot = parseJson(revision.snapshot_json, {});
+  snapshot.compliance = normalizeDisclosures(disclosure
+    ? {...disclosure, seller_attested: asBool(disclosure.seller_attested)}
+    : snapshot.compliance);
   snapshot.photos = photos.map((photo) => ({
     asset_id: photo.asset_id,
     position: photo.position,
@@ -203,7 +225,7 @@ async function revisionDataMany(database, revisionIds, visibility = 'admin') {
   const ids = [...new Set(revisionIds.filter((id) => typeof id === 'string' && id))];
   if (!ids.length) return new Map();
   const placeholders = ids.map(() => '?').join(',');
-  const [revisions, photos, configurations] = await Promise.all([
+  const [revisions, photos, configurations, disclosures] = await Promise.all([
     all(database.prepare(`SELECT * FROM catalog_artwork_revisions WHERE id IN (${placeholders})`).bind(...ids)),
     all(database.prepare(`SELECT rp.revision_id,rp.asset_id,rp.position,rp.is_main,rp.alt_text,a.source_kind,a.legacy_path,a.mime_type,a.width,a.height,a.byte_size,a.state
       FROM catalog_revision_photos rp JOIN catalog_media_assets a ON a.id=rp.asset_id
@@ -211,12 +233,17 @@ async function revisionDataMany(database, revisionIds, visibility = 'admin') {
     all(database.prepare(`SELECT rc.revision_id,rc.configuration_id AS id,rc.label,rc.enabled,rc.price_add_on_cents,
       rc.packing_profile_id,rc.position,p.label AS packing_profile_label,p.enabled AS packing_profile_enabled
       FROM catalog_revision_configurations rc LEFT JOIN catalog_packing_profiles p ON p.id=rc.packing_profile_id
-      WHERE rc.revision_id IN (${placeholders}) ORDER BY rc.revision_id,rc.position,rc.configuration_id`).bind(...ids))
+      WHERE rc.revision_id IN (${placeholders}) ORDER BY rc.revision_id,rc.position,rc.configuration_id`).bind(...ids)),
+    all(database.prepare(`SELECT revision_id,object_kind,blessed_or_dedicated,purported_relic,relic_class_claim,
+      contains_human_material,provenance_known,ecclesiastical_owner,authenticity_document,
+      spiritual_benefit_priced,seller_attested FROM catalog_revision_disclosures
+      WHERE revision_id IN (${placeholders})`).bind(...ids))
   ]);
   const byRevision = new Map(revisions.map((revision) => [revision.id, assembleRevision(
     revision,
     photos.filter((photo) => photo.revision_id === revision.id),
     configurations.filter((configuration) => configuration.revision_id === revision.id),
+    disclosures.find((disclosure) => disclosure.revision_id === revision.id),
     visibility
   )]));
   return byRevision;
@@ -230,6 +257,10 @@ async function revisionData(database, revisionId, visibility = 'admin') {
 
 async function hydrateAdmin(database, row, loaded = null) {
   const {revision, snapshot} = loaded || await revisionData(database, row.working_revision_id, 'admin');
+  const [complianceAssessment, aiSuggestion] = await Promise.all([
+    getActiveAssessment(database, row.working_revision_id),
+    getLatestAiSuggestion(database, row.working_revision_id)
+  ]);
   return {
     id: row.id,
     stable_id: row.stable_id,
@@ -246,6 +277,12 @@ async function hydrateAdmin(database, row, loaded = null) {
       version: row.inventory_version
     },
     store_position: row.store_position == null ? null : row.store_position + 1,
+    compliance_assessment: complianceAssessment,
+    ai_suggestion: aiSuggestion ? {
+      ...aiSuggestion.suggestions,
+      observations: aiSuggestion.observations,
+      uncertainties: aiSuggestion.uncertainties
+    } : null,
     draft: snapshot
   };
 }
@@ -278,12 +315,12 @@ export async function reconcileBaseline(database, actor = 'system:legacy-reconci
       id: item.published.id, artworkId: item.artwork.id, number: 1, parentId: null,
       importKey: item.published.import_key, source: 'legacy_public', snapshot: publicSnapshot, hash: publicHash, actor
     }));
-    statements.push(...childStatements(database, item.artwork.id, item.published.id, publicSnapshot));
+    statements.push(...childStatements(database, item.artwork.id, item.published.id, publicSnapshot, actor));
     statements.push(revisionInsert(database, {
       id: item.working.id, artworkId: item.artwork.id, number: 2, parentId: item.published.id,
       importKey: item.working.import_key, source: 'legacy_private', snapshot: privateDraft, hash: privateHash, actor
     }));
-    statements.push(...childStatements(database, item.artwork.id, item.working.id, privateDraft));
+    statements.push(...childStatements(database, item.artwork.id, item.working.id, privateDraft, actor));
     statements.push(database.prepare('INSERT INTO catalog_inventory(artwork_id,physical_stock,reserved_stock,version) VALUES(?,?,?,?)')
       .bind(item.artwork.id, item.inventory.physical_stock, item.inventory.reserved_stock, item.inventory.version));
     statements.push(database.prepare('INSERT INTO catalog_store_order(artwork_id,position) VALUES(?,?)').bind(item.artwork.id, item.store_position));
@@ -379,7 +416,7 @@ async function saveExisting(database, item, actor) {
   const hash = await hashSnapshot(snapshot);
   const statements = [
     revisionInsert(database, {id: revisionId, artworkId: head.id, number: version, parentId: head.working_revision_id, snapshot, hash, actor}),
-    ...childStatements(database, head.id, revisionId, snapshot),
+    ...childStatements(database, head.id, revisionId, snapshot, actor),
     database.prepare(`UPDATE catalog_artwork_heads SET working_revision_id=?,working_version=?,updated_at=unixepoch()
       WHERE artwork_id=? AND working_version=? AND archived_at IS NULL`).bind(revisionId, version, head.id, head.working_version),
     database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(?,?, 'save_draft', ?)")
@@ -414,7 +451,7 @@ async function saveNew(database, item, actor) {
     database.prepare('INSERT INTO catalog_artworks(id,stable_id,client_id) VALUES(?,?,?)').bind(artworkId, stableId, clientId),
     database.prepare('INSERT INTO catalog_inventory(artwork_id) VALUES(?)').bind(artworkId),
     revisionInsert(database, {id: revisionId, artworkId, number: 1, parentId: null, snapshot, hash, actor}),
-    ...childStatements(database, artworkId, revisionId, snapshot),
+    ...childStatements(database, artworkId, revisionId, snapshot, actor),
     database.prepare('INSERT INTO catalog_artwork_heads(artwork_id,working_revision_id,working_version) VALUES(?,?,1)').bind(artworkId, revisionId),
     database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(?,?, 'create_draft', ?)")
       .bind(artworkId, actor, JSON.stringify({revision_id: revisionId, client_id: clientId})),
@@ -442,7 +479,7 @@ export async function saveDraftBatch(database, payload, actor) {
   return {results};
 }
 
-async function publicationReadiness(database, artworkId, snapshot, inventory) {
+async function publicationReadiness(database, artworkId, revisionId, snapshot, inventory) {
   const fields = {};
   if (!snapshot.title.trim()) fieldError(fields, 'title', 'A title is required to publish.');
   if (!snapshot.photos.length || snapshot.photos.filter((photo) => photo.is_main).length !== 1) fieldError(fields, 'photos', 'A valid main photo is required to publish.');
@@ -458,6 +495,12 @@ async function publicationReadiness(database, artworkId, snapshot, inventory) {
       if (await one(database.prepare('SELECT id FROM catalog_packing_profiles WHERE id=? AND enabled=1').bind(id))) { validPacking = true; break; }
     }
     if (!validPacking) fieldError(fields, 'configurations', 'Enable at least one configuration with valid packing data.');
+    const assessment = revisionId ? await getActiveAssessment(database, revisionId) : null;
+    if (!['allow', 'human_approved'].includes(assessment?.effective_decision)) {
+      fieldError(fields, 'compliance', revisionId
+        ? 'Canonical listing review must allow this exact saved revision before it can be offered for sale.'
+        : 'Save this draft, then complete canonical listing review before publishing it for sale.');
+    }
   }
   return fields;
 }
@@ -465,7 +508,7 @@ async function publicationReadiness(database, artworkId, snapshot, inventory) {
 export async function previewDraft(database, identifier, draftInput) {
   const head = await resolveArtwork(database, identifier);
   const snapshot = draftInput ? validateDraftSnapshot(draftInput) : (await revisionData(database, head.working_revision_id)).snapshot;
-  const fields = await publicationReadiness(database, head.id, snapshot, head);
+  const fields = await publicationReadiness(database, head.id, draftInput ? null : head.working_revision_id, snapshot, head);
   return {artwork_id: head.id, stable_id: head.stable_id, state: artworkState(head), private: true, preview: snapshot, publish_errors: fields, can_publish: Object.keys(fields).length === 0};
 }
 
@@ -474,7 +517,7 @@ export async function publishArtwork(database, identifier, payload, actor) {
   const expected = payload?.expected_version;
   if (!Number.isSafeInteger(expected) || expected !== head.working_version) throw new HttpError(409, 'Draft changed in another session', {code: 'HEAD_CONFLICT', current_version: head.working_version});
   const {revision, snapshot} = await revisionData(database, head.working_revision_id);
-  const fields = await publicationReadiness(database, head.id, snapshot, head);
+  const fields = await publicationReadiness(database, head.id, head.working_revision_id, snapshot, head);
   if (Object.keys(fields).length) throw new HttpError(400, 'Artwork is not ready to publish', {fields});
   const commandId = uuid();
   const requested = head.store_position == null && revision.requested_store_position != null ? Math.max(0, revision.requested_store_position - 1) : null;
@@ -536,19 +579,22 @@ export async function saveStoreOrder(database, payload, actor) {
 
 async function hydratePublic(database, row, loaded = null) {
   const {snapshot} = loaded || await revisionData(database, row.published_revision_id, 'public');
-  const available = row.physical_stock == null ? null : row.physical_stock - row.reserved_stock;
+  const assessment = snapshot.offered_for_sale ? await getActiveAssessment(database, row.published_revision_id) : null;
+  const saleAllowed = !snapshot.offered_for_sale || ['allow', 'human_approved'].includes(assessment?.effective_decision);
+  const offeredForSale = snapshot.offered_for_sale && saleAllowed;
+  const available = offeredForSale && row.physical_stock != null ? row.physical_stock - row.reserved_stock : null;
   return {
     id: row.stable_id,
     revision_id: row.published_revision_id,
     title: snapshot.title,
     description: snapshot.description,
     category: snapshot.category,
-    base_price_cents: snapshot.base_price_cents,
+    base_price_cents: offeredForSale ? snapshot.base_price_cents : null,
     width_eighths: snapshot.width_eighths,
     height_eighths: snapshot.height_eighths,
-    offered_for_sale: snapshot.offered_for_sale,
+    offered_for_sale: offeredForSale,
     available_quantity: available,
-    sold_out: snapshot.offered_for_sale && available === 0,
+    sold_out: offeredForSale && available === 0,
     store_position: row.store_position == null ? null : row.store_position + 1,
     photos: snapshot.photos,
     configurations: snapshot.configurations.filter((configuration) => configuration.enabled).map((configuration) => ({
@@ -556,10 +602,25 @@ async function hydratePublic(database, row, loaded = null) {
       label: configuration.label,
       price_add_on_cents: configuration.price_add_on_cents,
       packing_profile_id: configuration.packing_profile_id,
-      merchandise_price_cents: snapshot.base_price_cents == null ? null : snapshot.base_price_cents + configuration.price_add_on_cents
+      merchandise_price_cents: !offeredForSale || snapshot.base_price_cents == null ? null : snapshot.base_price_cents + configuration.price_add_on_cents
     }))
   };
 }
+
+const publicSaleAllowedSql = `(EXISTS(
+  SELECT 1 FROM catalog_compliance_effective e
+  WHERE e.revision_id=r.id
+   AND e.policy_version=(
+    SELECT id FROM catalog_policy_versions WHERE status='active'
+    ORDER BY activated_at DESC,id DESC LIMIT 1
+   )
+   AND e.id=(
+    SELECT a2.id FROM catalog_compliance_assessments a2
+    WHERE a2.revision_id=r.id AND a2.policy_version=e.policy_version
+    ORDER BY a2.created_at DESC,a2.rowid DESC LIMIT 1
+   )
+   AND e.effective_decision IN ('allow','human_approved')
+ ))`;
 
 function publicWhere(options) {
   const clauses = ['h.archived_at IS NULL', 'h.published_revision_id IS NOT NULL'];
@@ -567,9 +628,9 @@ function publicWhere(options) {
   const search = searchClause(options.q);
   clauses.push(search.sql); values.push(...search.values);
   if (typeof options.category === 'string' && options.category.trim()) { clauses.push('r.category=?'); values.push(options.category.trim().slice(0,100)); }
-  if (options.availability === 'in_stock') clauses.push('r.offered_for_sale=1 AND i.physical_stock IS NOT NULL AND i.physical_stock-i.reserved_stock>0');
-  else if (options.availability === 'sold_out') clauses.push('r.offered_for_sale=1 AND i.physical_stock IS NOT NULL AND i.physical_stock-i.reserved_stock<=0');
-  else if (options.availability === 'display_only') clauses.push('r.offered_for_sale=0');
+  if (options.availability === 'in_stock') clauses.push(`r.offered_for_sale=1 AND ${publicSaleAllowedSql} AND i.physical_stock IS NOT NULL AND i.physical_stock-i.reserved_stock>0`);
+  else if (options.availability === 'sold_out') clauses.push(`r.offered_for_sale=1 AND ${publicSaleAllowedSql} AND i.physical_stock IS NOT NULL AND i.physical_stock-i.reserved_stock<=0`);
+  else if (options.availability === 'display_only') clauses.push(`(r.offered_for_sale=0 OR NOT ${publicSaleAllowedSql})`);
   return {sql: clauses.join(' AND '), values};
 }
 
@@ -584,8 +645,8 @@ export async function listPublicCatalog(database, options = {}) {
   const pages = Math.max(1, Math.ceil(total / size));
   const effective = Math.min(page, pages);
   let order = 'CASE WHEN o.position IS NULL THEN 1 ELSE 0 END,o.position,a.stable_id';
-  if (options.sort === 'price_asc') order = '(r.base_price_cents IS NULL),r.base_price_cents ASC,a.stable_id';
-  else if (options.sort === 'price_desc') order = '(r.base_price_cents IS NULL),r.base_price_cents DESC,a.stable_id';
+  if (options.sort === 'price_asc') order = `(r.offered_for_sale=0 OR NOT ${publicSaleAllowedSql} OR r.base_price_cents IS NULL),r.base_price_cents ASC,a.stable_id`;
+  else if (options.sort === 'price_desc') order = `(r.offered_for_sale=0 OR NOT ${publicSaleAllowedSql} OR r.base_price_cents IS NULL),r.base_price_cents DESC,a.stable_id`;
   const rows = await all(database.prepare(`SELECT a.id,a.stable_id,h.published_revision_id,i.physical_stock,i.reserved_stock,o.position AS store_position
     ${from} WHERE ${where.sql} ORDER BY ${order} LIMIT ? OFFSET ?`).bind(...where.values, size, (effective - 1) * size));
   const categories = (await all(database.prepare(`SELECT DISTINCT r.category ${from} WHERE h.archived_at IS NULL AND h.published_revision_id IS NOT NULL AND r.category IS NOT NULL ORDER BY r.category`)))
@@ -674,7 +735,7 @@ export async function commitSuccessfulUpload(database, uploadId, processed, acto
     ...processed.objects.map((object) => database.prepare(`INSERT INTO catalog_media_objects(object_key,asset_id,role,content_type,body)
       VALUES(?,?,?,?,?)`).bind(`${assetId}:${object.role}`, assetId, object.role, object.contentType, bytes(object.bytes))),
     revisionInsert(database, {id: revisionId, artworkId: session.artwork_id, number: version, parentId: session.working_revision_id, snapshot: normalized, hash, actor}),
-    ...childStatements(database, session.artwork_id, revisionId, normalized),
+    ...childStatements(database, session.artwork_id, revisionId, normalized, actor),
     database.prepare(`UPDATE catalog_artwork_heads SET working_revision_id=?,working_version=?,updated_at=unixepoch()
       WHERE artwork_id=? AND working_version=? AND archived_at IS NULL`).bind(revisionId, version, session.artwork_id, session.working_version),
     database.prepare(`UPDATE catalog_upload_sessions SET state='committed',asset_id=?,updated_at=unixepoch()

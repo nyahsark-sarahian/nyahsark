@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/entrypoint.js && node --check src/catalog.js && node --check src/commerce.js && node --check src/media.js",
+    "check": "node --check src/entrypoint.js && node --check src/catalog.js && node --check src/commerce.js && node --check src/media.js && node --check src/ai-assist.js && node --check src/compliance.js && node --check src/pricing-assist.js && node --check src/pricing-service.js",
     "test": "node --test test/*.test.mjs ui/*.test.mjs",
     "test:core": "node --test test/*.test.mjs",
     "deploy:dry": "wrangler deploy --dry-run --config wrangler.example.jsonc"

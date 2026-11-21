@@ -33,13 +33,13 @@ function authorizedFetch(path, init = {}) {
   return fetch(path, {...init, headers, credentials: 'same-origin', redirect: 'error', cache: init.cache || 'no-store'});
 }
 
-function authorizedUpload(path, file, onProgress) {
+function authorizedUpload(path, file, contentType, onProgress) {
   if (!path.startsWith('/api/admin/uploads/') || !access) throw new Error('Administrator sign-in required.');
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     request.open('PUT', path);
     request.setRequestHeader('Authorization', `Bearer ${access}`);
-    request.setRequestHeader('Content-Type', file.type);
+    request.setRequestHeader('Content-Type', contentType);
     request.responseType = 'json';
     request.upload.onprogress = event => {
       if (event.lengthComputable && onProgress) onProgress(Math.round(event.loaded * 100 / event.total));

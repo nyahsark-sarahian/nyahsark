@@ -13,9 +13,9 @@ export async function privateFetch(path, options = {}) {
   return activeAuth.authorizedFetch(path, options);
 }
 
-export async function privateUpload(path, file, onProgress) {
+export async function privateUpload(path, file, contentType, onProgress) {
   if (!activeAuth) throw new Error('Sign in with the approved administrator password first.');
-  return activeAuth.authorizedUpload(path, file, onProgress);
+  return activeAuth.authorizedUpload(path, file, contentType, onProgress);
 }
 
 export async function privateImage(image, path) {

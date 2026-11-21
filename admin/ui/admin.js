@@ -2,11 +2,20 @@ import {
   PAGE_SIZE, MAX_PHOTOS, MAX_UPLOAD_BYTES, SUPPORTED_IMAGE_TYPES,
   el, replace, announce, money, parsePriceCents, formatPriceInput,
   parseEighths, formatEighths, stepEighths, parseWhole, api, sendJSON,
-  uuid, safeAdminMedia, statusLabel,
+  uuid, safeAdminMedia, statusLabel, uploadMimeType,
 } from './common.js';
 import {getAuth, privateImage, privateUpload} from './session.js';
 
 const $ = selector => document.querySelector(selector);
+const TRI_STATE_OPTIONS = [['unknown', 'Not yet confirmed'], ['no', 'No'], ['yes', 'Yes']];
+const OBJECT_KIND_OPTIONS = [
+  ['unknown', 'Not yet confirmed'],
+  ['ordinary_devotional', 'Ordinary devotional artwork or object'],
+  ['sacramental', 'Sacramental'],
+  ['sacred_object', 'Blessed or dedicated sacred object'],
+  ['relic', 'Relic or purported relic'],
+  ['other', 'Other / needs review'],
+];
 const state = {
   page: 1,
   totalPages: 1,
@@ -33,13 +42,45 @@ function viewKey(page = state.page) { return `${state.query}\u0000${state.filter
 function hasDirtyCards() { return [...state.cache.values(), state.cards].flat().some(card => card.dirty); }
 function currentDirtyCards() { return state.cards.filter(card => card.dirty); }
 
+function emptyCompliance() {
+  return {
+    object_kind: 'unknown',
+    blessed_or_dedicated: 'unknown',
+    purported_relic: 'unknown',
+    relic_class_claim: null,
+    contains_human_material: 'unknown',
+    provenance_known: 'unknown',
+    ecclesiastical_owner: 'unknown',
+    authenticity_document: 'unknown',
+    spiritual_benefit_priced: 'unknown',
+    seller_attested: false,
+  };
+}
+
+function normalizeCompliance(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const normalized = {...emptyCompliance()};
+  const objectKinds = new Set(OBJECT_KIND_OPTIONS.map(([item]) => item));
+  if (objectKinds.has(source.object_kind)) normalized.object_kind = source.object_kind;
+  const triStates = new Set(TRI_STATE_OPTIONS.map(([item]) => item));
+  for (const field of [
+    'blessed_or_dedicated', 'purported_relic', 'contains_human_material', 'provenance_known',
+    'ecclesiastical_owner', 'authenticity_document', 'spiritual_benefit_priced',
+  ]) if (triStates.has(source[field])) normalized[field] = source[field];
+  normalized.relic_class_claim = typeof source.relic_class_claim === 'string' && source.relic_class_claim.trim()
+    ? source.relic_class_claim.trim().slice(0, 160)
+    : null;
+  normalized.seller_attested = source.seller_attested === true;
+  return normalized;
+}
+
 function emptyDraft() {
   return {
     title: '', description: '', category: null, base_price_cents: null,
     width_eighths: null, height_eighths: null, offered_for_sale: false,
     requested_store_position: null,
     inventory: {quantity_changed: false, intended_available_quantity: null, captured_version: 0},
-    photos: [], configurations: [],
+    photos: [], configurations: [], compliance: emptyCompliance(),
   };
 }
 
@@ -69,6 +110,7 @@ function normalizeCard(raw = {}) {
   const source = raw.working_revision?.snapshot || raw.working?.snapshot || raw.draft || raw.snapshot || raw.working_revision || raw.working || raw;
   const draft = {...emptyDraft(), ...clone(source)};
   draft.inventory = {...emptyDraft().inventory, ...(source.inventory || {})};
+  draft.compliance = normalizeCompliance(source.compliance);
   draft.photos = (source.photos || []).map(normalizePhoto).sort((a, b) => a.position - b.position).map((photo, index) => ({...photo, position: index}));
   draft.configurations = (source.configurations || []).map(normalizeConfiguration);
   const available = raw.inventory?.available_quantity ?? raw.inventory?.available ?? raw.available_quantity ?? null;
@@ -89,6 +131,15 @@ function normalizeCard(raw = {}) {
     saveState: raw.__new ? 'unsaved' : 'saved',
     fieldErrors: {},
     validation: raw.validation || {},
+    copilot: {
+      assessment: raw.compliance_assessment || raw.assistance?.assessment || null,
+      suggestion: raw.ai_suggestion || raw.assistance?.suggestion || null,
+      priceGuidance: null,
+      priceFloor: '',
+      message: '',
+      busy: false,
+      reviewNote: '',
+    },
     _raw: {
       price: formatPriceInput(draft.base_price_cents),
       width: formatEighths(draft.width_eighths).replace(/ in$/, ''),
@@ -147,6 +198,7 @@ function serializeCard(card) {
   draft.category = draft.category?.trim() || null;
   draft.title = draft.title.trim();
   draft.description = draft.description.trim();
+  draft.compliance = normalizeCompliance(draft.compliance);
   draft.photos = draft.photos.map(({asset_id, alt, position, is_main}) => ({asset_id, alt: String(alt || '').trim(), position, is_main: is_main === true}));
   if (draft.photos.length > MAX_PHOTOS) errors.photos = 'An artwork may have at most four photos.';
   if (draft.photos.length && draft.photos.filter(photo => photo.is_main).length !== 1) errors.photos = 'Choose exactly one main photo.';
@@ -255,7 +307,7 @@ function renderPhotos(card, cardNode, container) {
     const up = el('button', 'Move up', {type: 'button', class: 'secondary', disabled: photo.position === 0}); up.addEventListener('click', () => move(-1));
     const down = el('button', 'Move down', {type: 'button', class: 'secondary', disabled: photo.position === card.draft.photos.length - 1}); down.addEventListener('click', () => move(1));
     const replaceButton = el('button', 'Replace', {type: 'button', class: 'secondary'});
-    const replaceInput = el('input', null, {type: 'file', accept: 'image/jpeg,image/png,image/webp', hidden: true});
+    const replaceInput = el('input', null, {type: 'file', accept: '.heic,.heif,image/heic,image/heif,image/jpeg,image/png,image/webp', hidden: true});
     replaceButton.addEventListener('click', () => replaceInput.click());
     replaceInput.addEventListener('change', () => { if (replaceInput.files[0]) void uploadFiles(card, cardNode, [replaceInput.files[0]], photo.asset_id); });
     const remove = el('button', 'Remove', {type: 'button', class: 'danger'});
@@ -268,8 +320,8 @@ function renderPhotos(card, cardNode, container) {
     grid.append(photoCard);
   }
   const uploadBox = el('div', null, {class: 'upload-box'});
-  uploadBox.append(el('p', `JPEG, PNG, or WebP. Up to ${MAX_PHOTOS} photos, 5 MiB each, 16 MP, and 8192 px per side. HEIC/HEIF is not supported.`));
-  const file = el('input', null, {type: 'file', accept: 'image/jpeg,image/png,image/webp', multiple: true, disabled: card.state === 'archived' || card.draft.photos.length >= MAX_PHOTOS});
+  uploadBox.append(el('p', `JPEG, PNG, WebP, HEIC, or HEIF. The backend converts every accepted upload to private WebP derivatives. Up to ${MAX_PHOTOS} photos, 5 MiB each, 16 MP, and 8192 px per side.`));
+  const file = el('input', null, {type: 'file', accept: '.heic,.heif,image/heic,image/heif,image/jpeg,image/png,image/webp', multiple: true, disabled: card.state === 'archived' || card.draft.photos.length >= MAX_PHOTOS});
   const progress = el('p', '', {class: 'progress', ariaLive: 'polite'});
   file.addEventListener('change', () => { if (file.files.length) void uploadFiles(card, cardNode, [...file.files], null, progress); });
   uploadBox.append(inputLabel('Add photos', file), progress);
@@ -288,15 +340,16 @@ async function uploadFiles(card, cardNode, files, replaceAssetId = null, progres
   const availableSlots = replaceAssetId ? 1 : MAX_PHOTOS - card.draft.photos.length;
   if (files.length > availableSlots) { announce(`Only ${availableSlots} more photo${availableSlots === 1 ? '' : 's'} can be added.`, true); return; }
   for (const file of files) {
-    if (!SUPPORTED_IMAGE_TYPES.has(file.type)) { announce(`${file.name}: supported types are JPEG, PNG, and WebP.`, true); continue; }
+    const contentType = uploadMimeType(file);
+    if (!SUPPORTED_IMAGE_TYPES.has(contentType)) { announce(`${file.name}: supported types are JPEG, PNG, WebP, HEIC, and HEIF.`, true); continue; }
     if (!file.size || file.size > MAX_UPLOAD_BYTES) { announce(`${file.name}: file must be no larger than 5 MiB.`, true); continue; }
     try {
       await ensureSaved(card);
-      const allocation = await sendJSON('/api/admin/uploads', 'POST', {artwork_id: card.id, expected_version: card.version, idempotency_key: uuid(), replace_asset_id: replaceAssetId, filename: file.name, content_type: file.type, byte_size: file.size});
+      const allocation = await sendJSON('/api/admin/uploads', 'POST', {artwork_id: card.id, expected_version: card.version, idempotency_key: uuid(), replace_asset_id: replaceAssetId, filename: file.name, content_type: contentType, byte_size: file.size});
       const uploadId = allocation.upload_id || allocation.id;
       if (!uploadId) throw new Error('Upload allocation failed.');
       if (progressNode) progressNode.textContent = `${file.name}: 0%`;
-      const result = await privateUpload(allocation.upload_url || `/api/admin/uploads/${uploadId}`, file, percent => {
+      const result = await privateUpload(allocation.upload_url || `/api/admin/uploads/${uploadId}`, file, contentType, percent => {
         const node = progressNode || cardNode.querySelector('.progress');
         if (node) node.textContent = `${file.name}: ${percent}%`;
       });
@@ -348,6 +401,443 @@ function renderConfigurations(card, cardNode, container) {
   container.append(list, add);
 }
 
+function disclosureSelect(card, cardNode, field, labelText, choices = TRI_STATE_OPTIONS) {
+  const select = el('select');
+  for (const [value, label] of choices) select.append(el('option', label, {value, selected: card.draft.compliance[field] === value}));
+  select.addEventListener('change', () => {
+    card.draft.compliance[field] = select.value;
+    markDirty(card, cardNode);
+  });
+  return inputLabel(labelText, select);
+}
+
+function normalizeCopySuggestion(payload) {
+  const source = payload?.suggestion || payload?.suggestions || payload?.copy || payload;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) throw new Error('The assistant returned an unexpected suggestion. No draft fields were changed.');
+  const text = value => typeof value === 'string' && value.trim() ? value.trim() : null;
+  const rawAlt = Array.isArray(source.alt_texts) ? source.alt_texts : Array.isArray(source.photo_alt_texts) ? source.photo_alt_texts : [];
+  const altTexts = rawAlt.map((item, index) => {
+    if (typeof item === 'string') return {index, asset_id: null, alt: text(item)};
+    return {
+      index: Number.isSafeInteger(item?.index) ? item.index : index,
+      asset_id: text(item?.asset_id),
+      alt: text(item?.alt_text ?? item?.alt ?? item?.text),
+    };
+  }).filter(item => item.alt);
+  const observations = (Array.isArray(source.observations) ? source.observations : []).map((item) => ({
+    code: text(item?.code),
+    summary: text(item?.summary),
+    evidence: text(item?.evidence),
+    asset_id: text(item?.asset_id),
+    confidence: typeof item?.confidence === 'number' && Number.isFinite(item.confidence) ? Math.max(0, Math.min(1, item.confidence)) : null,
+  })).filter(item => item.summary && item.evidence);
+  const suggestion = {
+    title: text(source.title),
+    description: text(source.description),
+    category: text(source.category),
+    visible_condition: text(source.visible_condition ?? source.condition),
+    alt_texts: altTexts,
+    observations,
+    uncertainties: (Array.isArray(source.uncertainties) ? source.uncertainties : []).map(text).filter(Boolean),
+  };
+  if (!suggestion.title && !suggestion.description && !suggestion.category && !suggestion.visible_condition && !suggestion.alt_texts.length) {
+    throw new Error('The assistant did not return any usable suggestions. No draft fields were changed.');
+  }
+  return suggestion;
+}
+
+function applyCopilotSuggestion(card, field = 'all') {
+  const suggestion = card.copilot?.suggestion;
+  if (!suggestion) return;
+  if ((field === 'all' || field === 'title') && suggestion.title) card.draft.title = suggestion.title;
+  if ((field === 'all' || field === 'description') && suggestion.description) card.draft.description = suggestion.description;
+  if ((field === 'all' || field === 'category') && suggestion.category) card.draft.category = suggestion.category;
+  if ((field === 'all' || field === 'visible_condition') && suggestion.visible_condition) {
+    const condition = `Visible condition: ${suggestion.visible_condition}`;
+    if (!card.draft.description.includes(condition)) card.draft.description = [card.draft.description.trim(), condition].filter(Boolean).join('\n\n');
+  }
+  if (field === 'all' || field === 'alt_texts') {
+    for (const item of suggestion.alt_texts || []) {
+      const photo = item.asset_id
+        ? card.draft.photos.find(candidate => candidate.asset_id === item.asset_id)
+        : card.draft.photos[item.index];
+      if (photo) photo.alt = item.alt;
+    }
+  }
+  markDirty(card);
+  card.copilot.message = 'Suggestions were applied only to the unsaved form. Review them, then save explicitly.';
+  renderCards();
+}
+
+function copilotUnavailableMessage(error) {
+  const code = error?.details?.details?.code;
+  if ([404, 501].includes(error?.status) || (error?.status === 503 && code === 'AI_ASSIST_UNAVAILABLE')) return 'Listing Copilot is not configured yet. No draft fields were changed.';
+  if (error?.status === 503) return 'Listing Copilot is temporarily unavailable. No draft fields were changed; try again later.';
+  return error?.message || 'Listing Copilot could not complete the request. No draft fields were changed.';
+}
+
+function copilotReady(card) {
+  return Boolean(card.id) && !card.dirty && card.state !== 'archived' && !card.copilot.busy;
+}
+
+async function requestCopySuggestion(card) {
+  if (!copilotReady(card)) {
+    card.copilot.message = card.dirty ? 'Save the current draft before asking for suggestions.' : 'Save this artwork before asking for suggestions.';
+    renderCards();
+    return;
+  }
+  card.copilot.busy = true;
+  card.copilot.message = 'Preparing editable wording suggestions…';
+  renderCards();
+  try {
+    const result = await sendJSON(`/api/admin/artworks/${encodeURIComponent(card.id)}/assist/draft-copy`, 'POST', {expected_version: card.version});
+    card.copilot.suggestion = normalizeCopySuggestion(result);
+    card.copilot.message = result.message || 'Suggestions are ready. Nothing has been saved or published.';
+    announce('Listing wording suggestions are ready for review.');
+  } catch (error) {
+    card.copilot.message = copilotUnavailableMessage(error);
+    announce(card.copilot.message, true);
+  } finally {
+    card.copilot.busy = false;
+    renderCards();
+  }
+}
+
+async function requestComplianceAssessment(card) {
+  if (!copilotReady(card)) {
+    card.copilot.message = card.dirty ? 'Save the current disclosures before running canonical review.' : 'Save this artwork before running canonical review.';
+    renderCards();
+    return;
+  }
+  card.copilot.busy = true;
+  card.copilot.message = 'Checking the saved revision against the canonical listing policy…';
+  renderCards();
+  try {
+    const result = await sendJSON(`/api/admin/artworks/${encodeURIComponent(card.id)}/compliance/assess`, 'POST', {expected_version: card.version});
+    card.copilot.assessment = result.assessment || result.compliance_assessment || result;
+    if (result.suggestion) card.copilot.suggestion = normalizeCopySuggestion(result);
+    card.copilot.message = result.message || 'Canonical review completed for this saved revision.';
+    announce('Canonical listing review completed.');
+  } catch (error) {
+    card.copilot.message = copilotUnavailableMessage(error);
+    announce(card.copilot.message, true);
+  } finally {
+    card.copilot.busy = false;
+    renderCards();
+  }
+}
+
+function effectiveComplianceDecision(card) {
+  return String(card.copilot?.assessment?.effective_decision || card.copilot?.assessment?.decision || '').toLowerCase();
+}
+
+function normalizePriceGuidance(payload) {
+  const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+  const initial = source.initial && typeof source.initial === 'object' && !Array.isArray(source.initial) ? source.initial : null;
+  const markdown = source.markdown && typeof source.markdown === 'object' && !Array.isArray(source.markdown) ? source.markdown : null;
+  const evidence = source.evidence && typeof source.evidence === 'object' && !Array.isArray(source.evidence) ? source.evidence : {};
+  if (!initial && !markdown) throw new Error('Price guidance returned an unexpected response. No price was changed.');
+  return {initial, markdown, evidence};
+}
+
+async function requestPriceGuidance(card) {
+  if (!copilotReady(card)) {
+    card.copilot.message = card.dirty ? 'Save the current listing before asking for price guidance.' : 'Save this artwork before asking for price guidance.';
+    renderCards();
+    return;
+  }
+  if (!['allow', 'human_approved'].includes(effectiveComplianceDecision(card))) {
+    card.copilot.message = 'Canonical listing review must allow this exact revision before price guidance is available.';
+    renderCards();
+    return;
+  }
+  let floor = null;
+  try {
+    floor = parsePriceCents(card.copilot.priceFloor, {allowBlank: true});
+    const current = parsePriceCents(card._raw.price, {allowBlank: true, positive: true});
+    if (current !== null && floor !== null && floor > current) throw new Error('Seller floor cannot be higher than the saved price.');
+  } catch (error) {
+    card.copilot.message = error.message;
+    renderCards();
+    return;
+  }
+  card.copilot.busy = true;
+  card.copilot.message = 'Checking verified sales and server-owned listing activity…';
+  renderCards();
+  try {
+    const result = await sendJSON(`/api/admin/artworks/${encodeURIComponent(card.id)}/assist/price`, 'POST', {
+      expected_version: card.version,
+      seller_floor_cents: floor,
+    });
+    card.copilot.priceGuidance = normalizePriceGuidance(result);
+    card.copilot.message = result.message || 'Advisory price guidance is ready. No price was changed.';
+    announce('Advisory price guidance is ready for review.');
+  } catch (error) {
+    card.copilot.message = error?.message || 'Price guidance could not be prepared. No price was changed.';
+    announce(card.copilot.message, true);
+  } finally {
+    card.copilot.busy = false;
+    renderCards();
+  }
+}
+
+function applyPriceGuidance(card, cents, label) {
+  if (!Number.isSafeInteger(cents) || cents < 1) return;
+  card._raw.price = formatPriceInput(cents);
+  card.draft.base_price_cents = cents;
+  markDirty(card);
+  card.copilot.message = `${label} was applied only to the unsaved form. Sarah can change or discard it before saving.`;
+  renderCards();
+}
+
+async function submitHumanReview(card, decision) {
+  const note = card.copilot.reviewNote.trim();
+  if (!note) {
+    card.copilot.message = 'Enter a review or appeal note before recording a human decision.';
+    renderCards();
+    return;
+  }
+  if (!copilotReady(card)) {
+    card.copilot.message = 'Save the current draft before recording a human review decision.';
+    renderCards();
+    return;
+  }
+  card.copilot.busy = true;
+  card.copilot.message = 'Recording the human review decision…';
+  renderCards();
+  try {
+    const result = await sendJSON(`/api/admin/artworks/${encodeURIComponent(card.id)}/compliance/review`, 'POST', {expected_version: card.version, decision, note});
+    const assessment = result.assessment || result.compliance_assessment || result.decision;
+    card.copilot.assessment = typeof assessment === 'string' ? {decision: assessment} : assessment || card.copilot.assessment;
+    card.copilot.reviewNote = '';
+    card.copilot.message = result.message || 'Human review decision recorded in the audit history.';
+    announce('Human compliance review recorded.');
+  } catch (error) {
+    card.copilot.message = copilotUnavailableMessage(error);
+    announce(card.copilot.message, true);
+  } finally {
+    card.copilot.busy = false;
+    renderCards();
+  }
+}
+
+function renderCopySuggestion(card, container) {
+  const suggestion = card.copilot.suggestion;
+  if (!suggestion) return;
+  const panel = el('section', null, {class: 'copilot-suggestion', ariaLabel: 'Editable assistant suggestions'});
+  panel.append(el('h4', 'Suggested wording'));
+  const fields = [
+    ['title', 'Title'], ['description', 'Description'], ['category', 'Category'], ['visible_condition', 'Visible condition'],
+  ];
+  for (const [field, label] of fields) {
+    if (!suggestion[field]) continue;
+    const item = el('div', null, {class: 'suggestion-item'});
+    item.append(el('strong', label), el('p', suggestion[field]));
+    const apply = el('button', `Apply ${label.toLowerCase()}`, {type: 'button', class: 'secondary'});
+    apply.addEventListener('click', () => applyCopilotSuggestion(card, field));
+    item.append(apply); panel.append(item);
+  }
+  if (suggestion.alt_texts?.length) {
+    const item = el('div', null, {class: 'suggestion-item'});
+    item.append(el('strong', 'Photo descriptions'));
+    const list = el('ul');
+    for (const alt of suggestion.alt_texts) list.append(el('li', alt.alt));
+    item.append(list);
+    const apply = el('button', 'Apply photo descriptions', {type: 'button', class: 'secondary'});
+    apply.addEventListener('click', () => applyCopilotSuggestion(card, 'alt_texts'));
+    item.append(apply); panel.append(item);
+  }
+  if (suggestion.uncertainties?.length) {
+    panel.append(el('strong', 'Seller verification needed'));
+    const list = el('ul', null, {class: 'copilot-uncertainties'});
+    for (const uncertainty of suggestion.uncertainties) list.append(el('li', uncertainty));
+    panel.append(list);
+  }
+  if (suggestion.observations?.length) {
+    panel.append(el('strong', 'Bounded visual observations (not authentication)'));
+    const list = el('ul', null, {class: 'copilot-observations'});
+    for (const observation of suggestion.observations) {
+      const confidence = observation.confidence === null ? '' : ` Confidence: ${Math.round(observation.confidence * 100)}%.`;
+      list.append(el('li', `${observation.summary} Evidence: ${observation.evidence}.${confidence}`));
+    }
+    panel.append(list);
+  }
+  const applyAll = el('button', 'Apply all suggested wording', {type: 'button', class: 'primary'});
+  applyAll.addEventListener('click', () => applyCopilotSuggestion(card));
+  panel.append(applyAll, el('p', 'Applying suggestions changes only this unsaved form. It never saves or publishes.', {class: 'help'}));
+  container.append(panel);
+}
+
+function renderPriceGuidance(card, container) {
+  const wrapper = el('section', null, {class: 'copilot-pricing', ariaLabel: 'Advisory price guidance'});
+  wrapper.append(
+    el('h4', 'Advisory price guidance'),
+    el('p', 'Guidance uses verified store sales and server-owned activity only. It never changes a price automatically, and Sarah may override every suggestion.', {class: 'help'}),
+  );
+  const controls = el('div', null, {class: 'pricing-controls'});
+  const floor = el('input', null, {
+    type: 'text', inputMode: 'decimal', placeholder: 'Optional', value: card.copilot.priceFloor || '', disabled: !copilotReady(card),
+  });
+  floor.addEventListener('input', () => { card.copilot.priceFloor = floor.value; });
+  const request = el('button', card.copilot.busy ? 'Working…' : 'Get price guidance', {
+    type: 'button', class: 'secondary',
+    disabled: !copilotReady(card) || !['allow', 'human_approved'].includes(effectiveComplianceDecision(card)),
+  });
+  request.addEventListener('click', () => void requestPriceGuidance(card));
+  controls.append(inputLabel('Seller floor (USD, optional)', floor), request);
+  wrapper.append(controls);
+  if (!['allow', 'human_approved'].includes(effectiveComplianceDecision(card))) {
+    wrapper.append(el('p', 'Complete canonical listing review for this saved revision before requesting price guidance.', {class: 'help'}));
+  }
+
+  const guidance = card.copilot.priceGuidance;
+  if (guidance) {
+    const initial = guidance.initial;
+    const markdown = guidance.markdown;
+    const results = el('div', null, {class: 'pricing-results'});
+    const initialPanel = el('div', null, {class: 'pricing-result'});
+    initialPanel.append(el('strong', 'Initial price range'));
+    if (initial?.status === 'suggested' && Number.isSafeInteger(initial.low_cents) && Number.isSafeInteger(initial.midpoint_cents) && Number.isSafeInteger(initial.high_cents)) {
+      initialPanel.append(
+        el('p', `${money(initial.low_cents)}–${money(initial.high_cents)}; midpoint ${money(initial.midpoint_cents)}.`),
+        el('p', `${initial.comparable_count || 0} verified comparable sale${initial.comparable_count === 1 ? '' : 's'} · ${String(initial.confidence || 'low')} confidence.`, {class: 'help'}),
+      );
+      const apply = el('button', `Apply ${money(initial.midpoint_cents)} midpoint`, {type: 'button', class: 'secondary'});
+      apply.addEventListener('click', () => applyPriceGuidance(card, initial.midpoint_cents, 'The suggested midpoint'));
+      initialPanel.append(apply);
+    } else {
+      initialPanel.append(el('p', initial?.reason || 'There is not enough verified comparable-sale evidence yet.', {class: 'help'}));
+    }
+    const markdownPanel = el('div', null, {class: 'pricing-result'});
+    markdownPanel.append(el('strong', 'Listing-age adjustment'));
+    if (markdown?.status === 'suggested' && Number.isSafeInteger(markdown.proposed_price_cents) && Number.isSafeInteger(markdown.suggested_markdown_percent)) {
+      markdownPanel.append(
+        el('p', `Consider ${markdown.suggested_markdown_percent}% off, to ${money(markdown.proposed_price_cents)}.`),
+        el('p', Array.isArray(markdown.rationale) ? markdown.rationale.join(' ') : 'The recommendation uses listing age and verified buyer activity.', {class: 'help'}),
+      );
+      const apply = el('button', `Apply ${money(markdown.proposed_price_cents)}`, {type: 'button', class: 'secondary'});
+      apply.addEventListener('click', () => applyPriceGuidance(card, markdown.proposed_price_cents, 'The suggested markdown'));
+      markdownPanel.append(apply);
+    } else {
+      markdownPanel.append(el('p', markdown?.reason || 'There is not enough listing-age and buyer-activity evidence for a markdown.', {class: 'help'}));
+    }
+    results.append(initialPanel, markdownPanel);
+    wrapper.append(results, el('p', 'Applying guidance changes only the unsaved price field. It never saves, publishes, or changes a live price.', {class: 'help'}));
+  }
+  container.append(wrapper);
+}
+
+function renderAssessment(card, container) {
+  const assessment = card.copilot.assessment;
+  const decision = String(assessment?.effective_decision || assessment?.decision || assessment?.status || 'not_checked').toLowerCase();
+  const labels = {
+    allow: 'Allowed by the current listing policy',
+    human_approved: 'Approved after human review',
+    review: 'Human review required',
+    request_information: 'More information required',
+    block: 'Sale listing blocked',
+    human_blocked: 'Blocked after human review',
+    pending: 'Review pending',
+    error: 'Review could not be completed',
+    not_checked: 'Not checked yet',
+  };
+  const status = el('div', null, {class: `copilot-status ${decision}`, role: 'status', ariaLive: 'polite'});
+  status.append(el('strong', labels[decision] || 'Review status unavailable'));
+  const reasons = assessment?.messages || assessment?.reasons || assessment?.reason_codes || [];
+  if (Array.isArray(reasons) && reasons.length) {
+    const list = el('ul');
+    for (const reason of reasons) list.append(el('li', typeof reason === 'string' ? reason : reason.message || reason.code || 'Review note'));
+    status.append(list);
+  }
+  const policy = assessment?.policy_version || assessment?.policyVersion;
+  status.append(el('p', policy ? `Policy: ${policy}` : 'Policy: canonical-listing-v1', {class: 'help'}));
+  container.append(status);
+}
+
+function renderListingCopilot(card, cardNode) {
+  card.draft.compliance = normalizeCompliance(card.draft.compliance);
+  card.copilot ||= {assessment: null, suggestion: null, priceGuidance: null, priceFloor: '', message: '', busy: false, reviewNote: ''};
+  card.copilot.priceGuidance ??= null;
+  card.copilot.priceFloor ??= '';
+  const section = el('section', null, {class: 'card-section copilot-panel'});
+  section.append(
+    el('h3', 'Listing Copilot'),
+    el('p', 'These disclosures and photographs support description drafting and canonical-policy screening. A photograph cannot prove a blessing, provenance, or relic authenticity.', {class: 'help'}),
+  );
+
+  const disclosures = el('fieldset', null, {class: 'compliance-disclosures'});
+  disclosures.append(el('legend', 'Seller disclosures'));
+  const grid = el('div', null, {class: 'field-grid three disclosure-grid'});
+  grid.append(
+    disclosureSelect(card, cardNode, 'object_kind', 'Object type', OBJECT_KIND_OPTIONS),
+    disclosureSelect(card, cardNode, 'blessed_or_dedicated', 'Blessed or dedicated?'),
+    disclosureSelect(card, cardNode, 'purported_relic', 'Claimed to be a relic?'),
+    disclosureSelect(card, cardNode, 'contains_human_material', 'Contains human material?'),
+    disclosureSelect(card, cardNode, 'provenance_known', 'Provenance known?'),
+    disclosureSelect(card, cardNode, 'ecclesiastical_owner', 'Owned by a church or ecclesiastical entity?'),
+    disclosureSelect(card, cardNode, 'authenticity_document', 'Relic authenticity document present?'),
+    disclosureSelect(card, cardNode, 'spiritual_benefit_priced', 'Price includes a blessing or spiritual benefit?'),
+  );
+  const relicClaim = el('input', null, {type: 'text'});
+  relicClaim.maxLength = 160;
+  relicClaim.placeholder = 'Example: first-class, ex ossibus, contact relic';
+  relicClaim.value = card.draft.compliance.relic_class_claim || '';
+  relicClaim.addEventListener('input', () => {
+    card.draft.compliance.relic_class_claim = relicClaim.value.trim() || null;
+    markDirty(card, cardNode);
+  });
+  grid.append(inputLabel('Relic classification claimed (if any)', relicClaim));
+  disclosures.append(grid);
+  const attestation = el('input', null, {type: 'checkbox', checked: card.draft.compliance.seller_attested});
+  attestation.addEventListener('change', () => { card.draft.compliance.seller_attested = attestation.checked; markDirty(card, cardNode); });
+  const attestationLabel = el('label', null, {class: 'copilot-attestation'});
+  attestationLabel.append(attestation, document.createTextNode(' I confirm these answers are accurate to the best of my knowledge and understand that AI observations are not authentication.'));
+  disclosures.append(attestationLabel);
+  section.append(disclosures);
+
+  renderAssessment(card, section);
+  const unavailableReason = !card.id ? 'Save this artwork to enable Listing Copilot.'
+    : card.dirty ? 'Save the current draft and disclosures to enable analysis for the exact revision.'
+      : card.state === 'archived' ? 'Restore this artwork before using Listing Copilot.' : '';
+  if (unavailableReason) section.append(el('p', unavailableReason, {class: 'help copilot-prerequisite'}));
+
+  const actions = el('div', null, {class: 'copilot-actions'});
+  const suggest = el('button', card.copilot.busy ? 'Working…' : 'Draft description and alt text', {type: 'button', class: 'secondary', disabled: !copilotReady(card)});
+  suggest.addEventListener('click', () => void requestCopySuggestion(card));
+  const assess = el('button', card.copilot.busy ? 'Working…' : 'Run canonical listing review', {type: 'button', class: 'secondary', disabled: !copilotReady(card)});
+  assess.addEventListener('click', () => void requestComplianceAssessment(card));
+  actions.append(suggest, assess); section.append(actions);
+
+  if (card.copilot.message) section.append(el('p', card.copilot.message, {class: 'copilot-message', role: 'status', ariaLive: 'polite'}));
+  renderCopySuggestion(card, section);
+  renderPriceGuidance(card, section);
+
+  const review = el('div', null, {class: 'copilot-review'});
+  review.append(el('h4', 'Human review or appeal'));
+  const note = el('textarea', null, {rows: 3, minLength: 8, maxLength: 2000, placeholder: 'Record the evidence, clarification, or appeal reason (at least 8 characters).'});
+  note.value = card.copilot.reviewNote;
+  const reviewActions = el('div', null, {class: 'copilot-actions'});
+  const approve = el('button', 'Approve after review', {type: 'button', class: 'secondary'});
+  const requestInfo = el('button', 'Request more information', {type: 'button', class: 'secondary'});
+  const block = el('button', 'Block after review', {type: 'button', class: 'danger'});
+  const currentDecision = String(card.copilot.assessment?.effective_decision || card.copilot.assessment?.decision || card.copilot.assessment?.status || 'not_checked').toLowerCase();
+  const updateReviewButtons = () => {
+    const disabled = !copilotReady(card) || card.copilot.reviewNote.trim().length < 8 || !card.copilot.assessment;
+    approve.disabled = disabled || currentDecision !== 'review';
+    requestInfo.disabled = disabled; block.disabled = disabled;
+  };
+  note.addEventListener('input', () => { card.copilot.reviewNote = note.value; updateReviewButtons(); });
+  approve.addEventListener('click', () => void submitHumanReview(card, 'approve'));
+  requestInfo.addEventListener('click', () => void submitHumanReview(card, 'request_information'));
+  block.addEventListener('click', () => void submitHumanReview(card, 'block'));
+  reviewActions.append(approve, requestInfo, block); updateReviewButtons();
+  review.append(inputLabel('Review / appeal note', note), reviewActions);
+  if (currentDecision === 'block') review.append(el('p', 'A hard block for an explicit relic sale or priced spiritual benefit cannot be overridden. The note can document an appeal or corrected evidence for a new revision.', {class: 'help'}));
+  review.append(el('p', 'Human decisions are recorded separately from AI observations and should cite the evidence reviewed.', {class: 'help'}));
+  section.append(review);
+  return section;
+}
+
 function stageMove(card, position) {
   const value = Number(position);
   if (!card.id || !Number.isSafeInteger(value) || value < 1) {
@@ -392,6 +882,7 @@ function renderCard(card) {
   commerce.append(inputLabel('Store availability', sale));
   const measurements = el('div', null, {class: 'field-grid'});
   measurements.append(dimensionControl(card, node, 'width', 'width_eighths', 'Width'), dimensionControl(card, node, 'height', 'height_eighths', 'Height'));
+  const copilot = renderListingCopilot(card, node);
 
   const storeOrder = el('div', null, {class: 'card-section'}); storeOrder.append(el('h3', 'Store position'));
   const orderControls = el('div', null, {class: 'order-actions'});
@@ -414,7 +905,7 @@ function renderCard(card) {
   const archive = el('button', card.state === 'draft' ? 'Archive Draft' : 'Remove from Store', {type: 'button', class: 'danger', hidden: card.state === 'archived'}); archive.addEventListener('click', () => void archiveCard(card));
   const restore = el('button', 'Restore Draft', {type: 'button', class: 'secondary', hidden: card.state !== 'archived'}); restore.addEventListener('click', () => void restoreCard(card));
   actions.append(save, preview, publish, archive, restore);
-  node.append(heading, identity, description, commerce, measurements, storeOrder, photos, configurations, errors, actions);
+  node.append(heading, identity, description, commerce, measurements, copilot, storeOrder, photos, configurations, errors, actions);
   renderErrors(card, node);
   return node;
 }
@@ -512,6 +1003,7 @@ async function saveCards(cards) {
         card.stableId = result.stable_id || card.stableId;
         card.version = result.version ?? result.revision_version ?? card.version + 1;
         card.state = result.state || card.state;
+        card.copilot = {assessment: null, suggestion: null, priceGuidance: null, priceFloor: '', message: '', busy: false, reviewNote: ''};
       }
       const savedDraft = serializeCard(card);
       savedDraft.configurations = savedDraft.configurations.map(normalizeConfiguration);

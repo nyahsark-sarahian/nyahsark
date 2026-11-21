@@ -10,6 +10,7 @@
     "html_handling": "none",
     "run_worker_first": true
   },
+  "ai": {"binding": "AI"},
   "d1_databases": [
     {
       "binding": "DB",
@@ -29,7 +30,11 @@
     "SUPABASE_URL": "https://REPLACE.supabase.co",
     "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_REPLACE",
     "SARAH_AUTH_SUB": "REPLACE_WITH_EXISTING_SUBJECT",
-    "IMAGE_TRANSFORM_QUALIFIED": "no"
+    "IMAGE_TRANSFORM_QUALIFIED": "no",
+    "AI_ASSIST_ENABLED": "no",
+    "AI_ASSIST_MODEL": "",
+    "AI_GATEWAY_ID": "",
+    "AI_ASSIST_JSON_MODE": "yes"
   }
 }
 

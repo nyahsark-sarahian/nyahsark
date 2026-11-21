@@ -3,7 +3,18 @@ import {privateFetch} from './session.js';
 export const PAGE_SIZE = 10;
 export const MAX_PHOTOS = 4;
 export const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
-export const SUPPORTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+export const SUPPORTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif']);
+
+export function uploadMimeType(file) {
+  const declared = String(file?.type || '').toLowerCase().split(';')[0].trim();
+  if (SUPPORTED_IMAGE_TYPES.has(declared)) return declared;
+  if (!declared || declared === 'application/octet-stream') {
+    const name = String(file?.name || '');
+    if (/\.heic$/i.test(name)) return 'image/heic';
+    if (/\.heif$/i.test(name)) return 'image/heif';
+  }
+  return declared;
+}
 
 export function el(tag, text, attrs = {}) {
   const node = document.createElement(tag);

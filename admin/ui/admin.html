@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Store administrator | Nyah's Ark</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to administrator workspace</a>
+  <section id="auth-panel" class="auth-page">
+    <div class="auth-card">
+      <p class="eyebrow">Nyah's Ark</p>
+      <h1>Sarah's store administrator</h1>
+      <p>Use the approved administrator account and password.</p>
+      <form id="sign-in">
+        <label>Username or email<input name="email" type="text" autocomplete="username" required></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">Sign in</button>
+      </form>
+      <button id="request-recovery" class="link-button" type="button">Forgot password</button>
+      <p id="auth-message" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <div id="admin-shell" hidden>
+    <header class="site-header">
+      <div>
+        <p class="eyebrow">Nyah's Ark</p>
+        <strong>Store administrator</strong>
+      </div>
+      <nav aria-label="Administrator sections">
+        <button class="nav-tab active" type="button" data-view="artwork">Artwork</button>
+        <button class="nav-tab" type="button" data-view="settings">Settings</button>
+        <button class="nav-tab" type="button" data-view="orders">Orders</button>
+      </nav>
+      <button id="sign-out" class="secondary" type="button">Sign out</button>
+    </header>
+
+    <main id="main">
+      <p id="message" class="message" role="status" aria-live="polite"></p>
+
+      <section id="artwork-view" class="app-view" aria-labelledby="artwork-heading">
+        <div class="workspace-heading">
+          <div>
+            <p class="eyebrow">Catalog workspace</p>
+            <h1 id="artwork-heading">Artwork</h1>
+          </div>
+          <div class="toolbar-actions">
+            <button id="add-artwork" class="secondary" type="button">Add Artwork</button>
+            <button id="save-all" class="primary" type="button">Save All Draft Changes</button>
+          </div>
+        </div>
+
+        <form id="catalog-controls" class="catalog-controls" role="search">
+          <label>Search by title<input id="catalog-search" name="q" type="search" autocomplete="off" placeholder="Search artwork"></label>
+          <label>Status
+            <select id="status-filter" name="status">
+              <option value="all">All</option>
+              <option value="draft">Drafts</option>
+              <option value="published">Published</option>
+              <option value="published_changes">Published with unpublished changes</option>
+              <option value="archived">Archived</option>
+            </select>
+          </label>
+          <button class="secondary" type="submit">Apply</button>
+        </form>
+
+        <div id="catalog-counts" class="status-counts" aria-label="Artwork counts"></div>
+        <div id="artwork-cards" class="artwork-cards" aria-live="polite"></div>
+
+        <nav class="pagination" aria-label="Artwork pages">
+          <button id="previous-page" class="secondary" type="button">Previous</button>
+          <label>Page <input id="page-number" type="number" min="1" step="1" value="1"></label>
+          <span id="page-summary">Showing 0 of 0</span>
+          <button id="next-page" class="secondary" type="button">Next</button>
+        </nav>
+
+        <section id="store-order-panel" class="panel" aria-labelledby="order-heading">
+          <div class="panel-heading">
+            <div><h2 id="order-heading">Store order</h2><p>Staged moves update the public display order only. They do not publish draft content.</p></div>
+            <button id="save-store-order" class="primary" type="button" disabled>Save Store Order</button>
+          </div>
+          <div id="staged-order" aria-live="polite">No staged order changes.</div>
+        </section>
+      </section>
+
+      <section id="settings-view" class="app-view" aria-labelledby="settings-heading" hidden>
+        <div class="workspace-heading"><div><p class="eyebrow">Business configuration</p><h1 id="settings-heading">Settings</h1></div></div>
+        <div id="settings-readiness" class="readiness" aria-live="polite"></div>
+        <form id="settings-form">
+          <fieldset>
+            <legend>Shipping origin</legend>
+            <p class="help">Leave unknown values blank. They will never be invented.</p>
+            <div class="field-grid">
+              <label>Address line 1<input name="origin_line1" autocomplete="street-address"></label>
+              <label>Address line 2<input name="origin_line2"></label>
+              <label>City<input name="origin_city" autocomplete="address-level2"></label>
+              <label>State / region<input name="origin_region" autocomplete="address-level1"></label>
+              <label>Postal code<input name="origin_postal" autocomplete="postal-code"></label>
+              <label>Country code<input name="origin_country" maxlength="2" placeholder="US"></label>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>Shipping and fulfillment</legend>
+            <label>Supported destinations<textarea name="destinations" rows="4" placeholder="One destination code per line"></textarea></label>
+            <label>Configured shipping services<textarea name="shipping_services" rows="4" placeholder="One provider service ID and label per line"></textarea></label>
+            <div class="field-grid">
+              <label>Handling amount (USD)<input name="handling_amount" inputmode="decimal"></label>
+              <label>Handling applies
+                <select name="handling_scope"><option value="">Not set</option><option value="order">Per order</option><option value="package">Per package</option></select>
+              </label>
+            </div>
+            <div class="check-row" role="group" aria-label="Enabled fulfillment methods">
+              <label><input type="checkbox" name="fulfillment_shipping"> Shipping</label>
+              <label><input type="checkbox" name="fulfillment_pickup"> Local pickup</label>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>Packing profiles</legend>
+            <p class="help">Packed dimensions are different from artwork dimensions. Use explicit units.</p>
+            <div id="packing-profiles"></div>
+            <button id="add-packing-profile" class="secondary" type="button">Add packing profile</button>
+          </fieldset>
+          <fieldset>
+            <legend>Tax and payment status</legend>
+            <div class="field-grid">
+              <label>Tax registration / configuration
+                <select name="tax_status"><option value="unconfigured">Not configured</option><option value="pending">Pending verification</option><option value="configured">Configured</option></select>
+              </label>
+              <label>Payment connection status<input name="payment_status" readonly></label>
+              <label>Payment mode<input name="payment_mode" readonly></label>
+              <label>Shipping quote status<input name="shipping_status" readonly></label>
+            </div>
+          </fieldset>
+          <button class="primary" type="submit">Save Settings</button>
+          <span id="settings-save-state" class="save-state" aria-live="polite">Saved</span>
+        </form>
+      </section>
+
+      <section id="orders-view" class="app-view" aria-labelledby="orders-heading" hidden>
+        <div class="workspace-heading"><div><p class="eyebrow">Customer orders</p><h1 id="orders-heading">Orders</h1></div></div>
+        <div id="orders-list" class="orders-list"></div>
+        <nav class="pagination" aria-label="Order pages">
+          <button id="previous-orders" class="secondary" type="button">Previous</button>
+          <span id="orders-summary">No orders</span>
+          <button id="next-orders" class="secondary" type="button">Next</button>
+        </nav>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="preview-dialog" aria-labelledby="preview-title">
+    <div class="dialog-heading"><h2 id="preview-title">Private artwork preview</h2><button id="close-preview" class="link-button" type="button">Close</button></div>
+    <p class="help">Authenticated private preview. This is not a public URL.</p>
+    <div id="preview-content"></div>
+  </dialog>
+
+  <datalist id="category-options"></datalist>
+  <script src="/supabase.js"></script>
+  <script src="/config.js"></script>
+  <script type="module" src="/auth/password-signin.js"></script>
+  <script type="module" src="/auth/request-recovery.js"></script>
+</body>
+</html>
+

@@ -1,0 +1,15 @@
+{
+  "name": "nyahsark",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test public-worker/test/*.test.mjs admin/test/*.test.mjs admin/ui/*.test.mjs",
+    "test:storefront": "node --test public-worker/test/*.test.mjs",
+    "test:admin": "node --test admin/test/*.test.mjs admin/ui/*.test.mjs",
+    "deploy:dry": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "4.165.0"
+  }
+}
+

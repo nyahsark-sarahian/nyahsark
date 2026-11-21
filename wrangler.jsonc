@@ -1,5 +1,23 @@
 {
   "name": "nyahsark",
+  "account_id": "22cf2afbf801d1f3f55930fd3fb3d3a0",
   "compatibility_date": "2026-11-18",
-  "assets": {"directory":"./public", "html_handling":"auto-trailing-slash", "not_found_handling":"404-page"}
+  "main": "./public-worker/gallery-worker.js",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page",
+    "run_worker_first": ["/api/*", "/catalog-media/*"]
+  },
+  "services": [
+    {
+      "binding": "PUBLISHED_CATALOG",
+      "service": "nyahsark-admin-staging"
+    }
+  ],
+  "vars": {
+    "GALLERY_ORIGIN": "https://nyahsark.com",
+    "CATALOG_PUBLIC_ORIGIN": "https://nyahsark.com"
+  }
 }

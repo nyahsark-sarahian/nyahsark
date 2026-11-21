@@ -1,0 +1,35 @@
+{
+  "name": "nyahsark-admin-staging",
+  "main": "src/entrypoint.js",
+  "compatibility_date": "2026-11-19",
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    "directory": "ui",
+    "binding": "ASSETS",
+    "html_handling": "none",
+    "run_worker_first": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nyahsark-admin-staging",
+      "database_id": "REPLACE_WITH_EXISTING_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "images": {"binding": "IMAGE_TRANSFORM"},
+  "rules": [
+    {"type": "Text", "globs": ["**/*.sql"], "fallthrough": true}
+  ],
+  "vars": {
+    "STAGING_ENABLED": "no",
+    "ADMIN_ORIGIN": "https://thearkadmin.nyahsark.com",
+    "STOREFRONT_ORIGIN": "https://nyahsark.com",
+    "SUPABASE_URL": "https://REPLACE.supabase.co",
+    "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_REPLACE",
+    "SARAH_AUTH_SUB": "REPLACE_WITH_EXISTING_SUBJECT",
+    "IMAGE_TRANSFORM_QUALIFIED": "no"
+  }
+}
+

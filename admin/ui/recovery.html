@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Reset administrator password | Nyah's Ark</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="auth-page">
+  <main class="auth-card">
+    <p class="eyebrow">Nyah's Ark</p>
+    <h1>Reset administrator password</h1>
+    <p id="recovery-status" role="status">Checking the recovery link…</p>
+    <form id="recovery" hidden>
+      <label>New password<input name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="72"></label>
+      <label>Confirm new password<input name="confirmation" type="password" autocomplete="new-password" required minlength="12" maxlength="72"></label>
+      <button class="primary" type="submit">Save new password</button>
+    </form>
+    <a href="/">Return to sign-in</a>
+  </main>
+  <script src="/config.js"></script>
+  <script type="module" src="/auth/recovery.js"></script>
+</body>
+</html>

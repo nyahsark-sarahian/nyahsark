@@ -10,7 +10,7 @@ import {
 import {LEGACY_BASELINE} from '../src/baseline.js';
 import {runDeterministicAssessment, saveAssessment, saveAiSuggestion} from '../src/compliance.js';
 
-const migrations=['0001_legacy_inventory.sql','0002_private_image_objects.sql','0003_revisioned_catalog.sql','0004_settings_commands.sql','0005_listing_compliance.sql']
+const migrations=['0001_legacy_inventory.sql','0002_private_image_objects.sql','0003_revisioned_catalog.sql','0004_settings_commands.sql','0005_listing_compliance.sql','0006_ai_governance.sql']
   .map(name=>readFileSync(new URL('../migrations/'+name,import.meta.url),'utf8'));
 
 const clearCompliance={
@@ -46,7 +46,7 @@ function seedLegacy(sqlite){
 
 const draft=(title='Draft')=>({
  title,description:'Description',category:'Test',base_price_cents:null,width_eighths:null,height_eighths:null,
- offered_for_sale:false,requested_store_position:null,
+ offered_for_sale:false,requested_store_position:null,made_to_order:'unknown',production_method:'unknown',
  inventory:{quantity_changed:false,intended_available_quantity:null,captured_version:0},photos:[],configurations:[]
 });
 
@@ -127,6 +127,35 @@ test('draft text rejects invisible and bidi controls before revision storage',as
  assert.throws(()=>validateDraftSnapshot({...draft(),configurations:[{id:'configuration-1',label:'Artwork\u2066 label',enabled:true,price_add_on_cents:0,packing_profile_id:null}]}),/validation/i);
  const normalized=validateDraftSnapshot({...draft('\uff2e\uff59\uff41\uff48'),description:'Description'});
  assert.equal(normalized.title,'Nyah');
+});
+
+test('made-to-order facts are validated, defaulted for legacy snapshots, and round-trip through immutable revisions',async()=>{
+ const legacyInput={...draft()};delete legacyInput.made_to_order;delete legacyInput.production_method;
+ const legacy=validateDraftSnapshot(legacyInput);
+ assert.equal(legacy.made_to_order,'unknown');
+ assert.equal(legacy.production_method,'unknown');
+ assert.throws(
+  ()=>validateDraftSnapshot({...draft(),made_to_order:'sometimes'}),
+  error=>error.status===400&&Boolean(error.details?.fields?.made_to_order)
+ );
+ assert.throws(
+  ()=>validateDraftSnapshot({...draft(),made_to_order:'yes',production_method:'unknown'}),
+  error=>error.status===400&&Boolean(error.details?.fields?.production_method)
+ );
+ assert.throws(
+  ()=>validateDraftSnapshot({...draft(),made_to_order:'yes',production_method:'screen_print'}),
+  error=>error.status===400&&Boolean(error.details?.fields?.production_method)
+ );
+ const stockedHeatPress=validateDraftSnapshot({...draft(),made_to_order:'no',production_method:'heat_press'});
+ assert.equal(stockedHeatPress.production_method,'heat_press');
+
+ const {DB}=await baseline();
+ const input={...draft('Made after purchase'),made_to_order:'yes',production_method:'heat_press'};
+ const saved=await saveDraftBatch(DB,{items:[{client_id:'client-made-order-001',draft:input}]},'test');
+ assert.equal(saved.results[0].success,true);
+ const item=await getAdminArtwork(DB,saved.results[0].artwork_id);
+ assert.equal(item.draft.made_to_order,'yes');
+ assert.equal(item.draft.production_method,'heat_press');
 });
 
 test('draft revisions persist normalized immutable disclosures and hydrate exact-revision copilot state',async()=>{

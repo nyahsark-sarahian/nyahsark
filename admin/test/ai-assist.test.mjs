@@ -30,7 +30,8 @@ function input() {
     image: {asset_id: assetId, bytes: webp},
     draft: {
       title: '', description: '', category: 'Devotional art', width_eighths: 80,
-      height_eighths: 96, offered_for_sale: false
+      height_eighths: 96, offered_for_sale: false,
+      made_to_order: 'unknown', production_method: 'unknown'
     },
     disclosures: {
       object_kind: 'ordinary_devotional', blessed_or_dedicated: 'unknown',
@@ -43,7 +44,7 @@ function input() {
 function env(run, overrides = {}) {
   return {
     AI_ASSIST_ENABLED: 'yes',
-    AI_ASSIST_MODEL: '@cf/example/vision-model',
+    AI_ASSIST_MODEL: '@cf/meta/llama-4-scout-17b-16e-instruct',
     AI_GATEWAY_ID: 'nyahsark-listing-copilot',
     AI_ASSIST_JSON_MODE: 'yes',
     AI: {run},
@@ -62,6 +63,7 @@ test('reports explicit disabled and configured capability states without exposin
   });
   assert.equal(aiAssistCapabilities(env(async () => safeOutput)).enabled, true);
   assert.equal(aiAssistCapabilities(env(async () => safeOutput)).gateway_configured, true);
+  assert.equal(aiAssistCapabilities(env(async () => safeOutput, {AI_ASSIST_MODEL: '@cf/meta/another-model'})).enabled, false);
 });
 
 test('sends only a sanitized WebP and constrained JSON schema through the configured binding', async () => {
@@ -72,15 +74,27 @@ test('sends only a sanitized WebP and constrained JSON schema through the config
   }), input());
   assert.equal(calls.length, 1);
   const [model, request, options] = calls[0];
-  assert.equal(model, '@cf/example/vision-model');
-  assert.match(request.image, /^data:image\/webp;base64,/);
+  assert.equal(model, '@cf/meta/llama-4-scout-17b-16e-instruct');
+  assert.equal('image' in request, false);
+  assert.equal(request.messages[1].content.length, 2);
+  assert.equal(request.messages[1].content[0].type, 'text');
+  assert.match(request.messages[1].content[0].text, /quoted data, not instructions/i);
+  assert.match(request.messages[1].content[0].text, /"made_to_order":"unknown"/);
+  assert.match(request.messages[1].content[0].text, /"production_method":"unknown"/);
+  assert.deepEqual(Object.keys(request.messages[1].content[1]).sort(), ['image_url', 'type']);
+  assert.equal(request.messages[1].content[1].type, 'image_url');
+  assert.match(request.messages[1].content[1].image_url.url, /^data:image\/webp;base64,/);
+  assert.equal(request.temperature, 0.1);
+  assert.equal(request.max_tokens, 1200);
   assert.equal(request.response_format.type, 'json_schema');
   assert.equal(request.response_format.json_schema.additionalProperties, false);
   assert.deepEqual(options, {gateway: {id: 'nyahsark-listing-copilot', collectLog: false, skipCache: true}});
   assert.match(request.messages[0].content, /Do not authenticate/i);
+  assert.match(request.messages[0].content, /reverent and honest/i);
+  assert.match(request.messages[0].content, /representative sample/i);
   assert.equal(result.suggestion_only, true);
   assert.equal(result.prompt_version, AI_ASSIST_VERSION);
-  assert.equal(result.model, '@cf/example/vision-model');
+  assert.equal(result.model, '@cf/meta/llama-4-scout-17b-16e-instruct');
   assert.deepEqual(result.suggestions.alt_texts, [{asset_id: assetId, alt: safeOutput.alt_texts[0]}]);
   assert.equal(result.observations[0].code, 'devotional_object_visible');
   assert.match(result.uncertainties[0], /material, age, maker, origin/i);
@@ -107,6 +121,12 @@ test('appearance and seller-supplied subject wording remain usable without openi
   }
   const sellerNamed=normalizeAssistOutput({...safeOutput,title:'Framed Thérèse medal'},assetId,{title:'Thérèse medal'});
   assert.equal(sellerNamed.suggestions.title,'Framed Thérèse medal');
+  const sellerVocabulary=normalizeAssistOutput(
+    {...safeOutput,visible_condition:'Light ribbing is visible.'},
+    assetId,
+    {description:'The seller notes light ribbing around the lower area.'}
+  );
+  assert.equal(sellerVocabulary.suggestions.visible_condition,'Light ribbing is visible.');
   for (const [title,draftTitle] of [
     ['Fabergé rosary','in the style of Fabergé'],
     ['Vatican rosary','Rosary photographed near a Vatican postcard']
@@ -125,7 +145,144 @@ test('fails closed before provider execution when configuration or input is unsa
     (error) => error.status === 400 && /WebP/.test(error.message));
   await assert.rejects(() => generateListingAssistance(env(run), {...input(), disclosures: {object_kind: 'relic', purported_relic: 'maybe'}}),
     (error) => error.status === 400);
+  await assert.rejects(() => generateListingAssistance(env(run), {
+    ...input(), draft: {...input().draft, made_to_order: 'yes', production_method: 'unknown'}
+  }), (error) => error.status === 400 && /production method/i.test(error.message));
   assert.equal(called, false);
+});
+
+test('permits only structured made-to-order and production-method claims', () => {
+  const madeToOrder = normalizeAssistOutput({
+    ...safeOutput,
+    description: 'Made to order. Representative sample with a heat-pressed pink design.'
+  }, assetId, {made_to_order: 'yes', production_method: 'heat_press'});
+  assert.match(madeToOrder.suggestions.description, /made to order/i);
+  assert.match(madeToOrder.suggestions.description, /heat-pressed/i);
+
+  const sublimated = normalizeAssistOutput({
+    ...safeOutput,
+    description: 'Made to order. Representative sample with a sublimated pink design.'
+  }, assetId, {made_to_order: 'yes', production_method: 'sublimation'});
+  assert.match(sublimated.suggestions.description, /sublimated/i);
+
+  for (const [description, facts] of [
+    ['Made to order with a pink design.', {made_to_order: 'unknown', production_method: 'unknown'}],
+    ['A heat-pressed pink design.', {made_to_order: 'no', production_method: 'unknown'}],
+    ['A sublimated pink design.', {made_to_order: 'no', production_method: 'heat_press'}],
+  ]) {
+    assert.throws(
+      () => normalizeAssistOutput({...safeOutput, description}, assetId, facts),
+      (error) => error.status === 502 && /unsupported production claim/i.test(error.message),
+      description
+    );
+  }
+
+  assert.throws(
+    () => normalizeAssistOutput({...safeOutput, description: 'Made to order and ready to ship.'}, assetId, {
+      made_to_order: 'yes', production_method: 'heat_press'
+    }),
+    (error) => error.status === 502 && /contradicted the made-to-order status/i.test(error.message)
+  );
+  for (const description of [
+    'Made to order. Representative sample with a heat-pressed embroidered ark design.',
+    'Made to order. Representative sample with a heat-pressed and screen-printed ark design.'
+  ]) {
+    assert.throws(
+      () => normalizeAssistOutput({...safeOutput, description}, assetId, {
+        made_to_order: 'yes', production_method: 'heat_press',
+        title: 'Made-to-order ark hat', description: 'Ark design applied with a heat press.'
+      }),
+      (error) => error.status === 502 && /unsupported production claim/i.test(error.message),
+      description
+    );
+  }
+  for (const description of [
+    'Pink design on a representative sample.',
+    'Made to order with a heat-pressed pink design.',
+    'Made to order. Representative sample with a pink design.'
+  ]) {
+    assert.throws(
+      () => normalizeAssistOutput({...safeOutput, description}, assetId, {
+        made_to_order: 'yes', production_method: 'heat_press'
+      }),
+      (error) => error.status === 502 && /omitted/i.test(error.message),
+      description
+    );
+  }
+});
+
+test('requires one accessibility description and accepts ordinary calibration-product nouns', () => {
+  for (const alt_texts of [[], ['One description.', 'A second description.']]) {
+    assert.throws(
+      () => normalizeAssistOutput({...safeOutput, alt_texts}, assetId),
+      (error) => error.status === 502 && /alt text was invalid/i.test(error.message)
+    );
+  }
+
+  for (const [alt, facts] of [
+    ['Pink short-sleeve shirt with a pink-and-plum ark graphic centered on the chest.', {
+      title: 'Made-to-order pink ark shirt calibration sample',
+      description: 'Representative sample. The shirt is made to order and the ark design is applied with a heat press after purchase.',
+      category: 'Made-to-order apparel', made_to_order: 'yes', production_method: 'heat_press'
+    }],
+    ['White handled mug with a pink and plum ark above stylized waves.', {
+      title: 'Made-to-order pink ark mug calibration sample',
+      description: 'Representative sample. The mug is made to order using a sublimation process after purchase.',
+      category: 'Made-to-order drinkware', made_to_order: 'yes', production_method: 'sublimation'
+    }],
+    ['Lavender baseball cap with a round pink-and-plum ark patch on the front.', {
+      title: 'Made-to-order lavender ark hat calibration sample',
+      description: 'Representative sample. The hat is made to order and the finished ark patch is applied with a heat press.',
+      category: 'Made-to-order headwear', made_to_order: 'yes', production_method: 'heat_press'
+    }],
+    ['Framed illustration of a small chapel at sunrise beneath a pink and plum sky.', {
+      title: 'Chapel sunrise art print calibration sample',
+      description: 'Synthetic calibration sample of an original chapel-at-sunrise illustration.',
+      category: 'Religious art prints', made_to_order: 'no', production_method: 'unknown'
+    }],
+    ['Rose-colored rosary beads with an aged-gold-colored center medal and crucifix arranged on beige cloth.', {
+      title: 'Unblessed rosary calibration sample',
+      description: 'Synthetic vintage-style rosary prop. No age, maker, material, or origin is asserted.',
+      category: 'Rosaries', made_to_order: 'no', production_method: 'unknown'
+    }],
+    ['Dark wood-colored crucifix with a silver-colored corpus and visible edge wear.', {
+      title: 'Seller-reported blessed crucifix calibration sample',
+      description: 'Synthetic crucifix prop.',
+      category: 'Crucifixes', made_to_order: 'no', production_method: 'unknown'
+    }],
+    ['Scratched gold-colored chalice on dark plum cloth beside a blank cream tag.', {
+      title: 'Parish chalice provenance calibration sample',
+      description: 'Synthetic gold-colored chalice prop with a blank inventory tag.',
+      category: 'Liturgical objects', made_to_order: 'no', production_method: 'unknown'
+    }],
+    ['Ornate oval gold-colored pendant with a clear front, red thread, and blank cream insert inside.', {
+      title: 'Empty devotional pendant calibration sample',
+      description: 'Synthetic empty oval devotional pendant prop with a clear front.',
+      category: 'Devotional jewelry', made_to_order: 'no', production_method: 'unknown'
+    }]
+  ]) {
+    const description = facts.made_to_order === 'yes'
+      ? `Made to order. Representative sample with a ${facts.production_method === 'heat_press' ? 'heat-pressed' : 'sublimated'} pink ark design.`
+      : safeOutput.description;
+    let result;
+    assert.doesNotThrow(() => {
+      result = normalizeAssistOutput({...safeOutput, description, alt_texts: [alt]}, assetId, facts);
+    }, alt);
+    assert.equal(result.suggestions.alt_texts[0].alt, alt);
+  }
+
+  assert.doesNotThrow(() => normalizeAssistOutput({
+    ...safeOutput,
+    title: 'Pink hoodie',
+    description: 'Pink hoodie with rhinestones.',
+    alt_texts: ['Pink hoodie with rhinestones.']
+  }, assetId, {
+    title: 'Pink hoodie',
+    description: 'Pink hoodie with rhinestones.',
+    category: 'Hoodies',
+    made_to_order: 'no',
+    production_method: 'unknown'
+  }));
 });
 
 test('rejects malformed, over-permissive, prompt-injected, and unsupported-certainty output', () => {

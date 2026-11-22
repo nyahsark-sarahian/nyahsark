@@ -19,13 +19,15 @@ import {
   saveHumanReview,
   validateDisclosures
 } from '../src/compliance.js';
+import {saveReviewEscalation} from '../src/listing-governance.js';
 
 const migrationNames = [
   '0001_legacy_inventory.sql',
   '0002_private_image_objects.sql',
   '0003_revisioned_catalog.sql',
   '0004_settings_commands.sql',
-  '0005_listing_compliance.sql'
+  '0005_listing_compliance.sql',
+  '0006_ai_governance.sql'
 ];
 
 function database() {
@@ -173,7 +175,11 @@ test('deterministic policy hard-blocks explicit relic commerce and priced spirit
     'Blessing €500',
     'Includes grace valued at 500 dollars',
     'EUR 500 for the spiritual benefit',
-    'Spiritual effect worth £50'
+    'Spiritual effect worth £50',
+    'Price includes a healing benefit',
+    'Pay a fee for a miracle prayer',
+    'Purchase includes divine protection',
+    'A fee for a prayer intention'
   ]) {
     const result = evaluatePolicy({
       offeredForSale: true,
@@ -183,6 +189,39 @@ test('deterministic policy hard-blocks explicit relic commerce and priced spirit
     assert.equal(result.decision, 'block', description);
     assert(result.reason_codes.includes('spiritual_benefit_sale'), description);
   }
+
+  const ordinaryPrayerCard = evaluatePolicy({
+    offeredForSale: true,
+    disclosures: clearDisclosures,
+    listingCopy: {title: 'Prayer card', description: 'Price is five dollars for the printed card.', category: 'Devotional art'}
+  });
+  assert.equal(ordinaryPrayerCard.decision, 'allow');
+});
+
+test('an explicit relic-status denial does not become an affirmative relic-sale block', () => {
+  const denial = evaluatePolicy({
+    offeredForSale: true,
+    disclosures: {...clearDisclosures, purported_relic: 'unknown'},
+    listingCopy: {
+      title: 'Empty devotional pendant',
+      description: 'Synthetic empty oval devotional pendant. No relic status is claimed.',
+      category: 'Devotional jewelry'
+    }
+  });
+  assert.equal(denial.decision, 'review');
+  assert(!denial.reason_codes.includes('sacred_relic_sale'));
+
+  const denialThenClaim = evaluatePolicy({
+    offeredForSale: true,
+    disclosures: clearDisclosures,
+    listingCopy: {
+      title: 'Pendant',
+      description: 'No relic status is claimed, but this is a relic offered for sale.',
+      category: 'Devotional jewelry'
+    }
+  });
+  assert.equal(denialThenClaim.decision, 'block');
+  assert(denialThenClaim.reason_codes.includes('sacred_relic_sale'));
 });
 
 test('saved listing copy cannot contradict clear disclosures and receive an allowance', async () => {
@@ -335,6 +374,18 @@ test('sale publish guard requires the latest effective allow or human approval',
   }, 'test');
   assert.equal(review.decision, 'review');
   assert.throws(() => publish(sqlite, reviewItem, 'publish-before-review'), /COMPLIANCE_REQUIRED/);
+  await assert.rejects(
+    () => saveHumanReview(DB, {assessment_id: review.id, decision: 'approve', note: 'Documentation reviewed.'}, 'reviewer:test'),
+    (error) => error?.details?.code === 'PRIEST_CLEARANCE_REQUIRED'
+  );
+  await saveReviewEscalation(DB, {
+    assessment_id: review.id, stage: 'seller_clarification', outcome: 'escalated', reviewer_role: 'Sarah',
+    note: 'The ambiguity remained after the seller clarification.'
+  }, 'reviewer:test');
+  await saveReviewEscalation(DB, {
+    assessment_id: review.id, stage: 'local_priest', outcome: 'cleared', reviewer_role: 'Local parish priest',
+    note: 'The priest reviewed the stated facts and cleared the item to continue marketplace review.'
+  }, 'reviewer:test');
   const approved = await saveHumanReview(DB, {assessment_id: review.id, decision: 'approve', note: 'Documentation reviewed.'}, 'reviewer:test');
   assert.equal(approved.effective_decision, 'human_approved');
   publish(sqlite, reviewItem, 'publish-after-review');

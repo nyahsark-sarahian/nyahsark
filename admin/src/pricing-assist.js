@@ -91,41 +91,52 @@ export function suggestMarkdown(input) {
   }
   if (!['allow', 'human_approved'].includes(decision)) return noMarkdown('Compliance review must allow the listing before pricing advice is available.');
   if (!integer(input.current_price_cents, 1, MAX_CENTS)) throw new TypeError('Current price is invalid');
+  if (!integer(input.original_price_cents, 1, MAX_CENTS)) throw new TypeError('Original listing price is invalid');
   if (!integer(input.seller_floor_cents, 0, input.current_price_cents)) throw new TypeError('Seller price floor is invalid');
   for (const field of ['listing_age_days', 'days_since_price_change', 'qualified_views', 'recent_carts', 'recent_inquiries', 'recent_checkout_starts']) {
     if (!integer(input[field], 0, 1_000_000)) throw new TypeError(`${field} is invalid`);
   }
-  const minimumViews = integer(input.minimum_qualified_views, 1, 100_000) ? input.minimum_qualified_views : 20;
-  const cooldownDays = integer(input.cooldown_days, 1, 365) ? input.cooldown_days : 14;
+  const cooldownDays = integer(input.cooldown_days, 1, 365) ? input.cooldown_days : 30;
   const maximumPercent = integer(input.maximum_markdown_percent, 1, 50) ? input.maximum_markdown_percent : 15;
-  if (input.listing_age_days < 30) return noMarkdown('The listing is too new for a markdown recommendation.');
+  if (input.listing_age_days < 45) return noMarkdown('The listing is too new for a markdown recommendation.');
   if (input.days_since_price_change < cooldownDays) return noMarkdown('Wait for the price-change cooldown before recommending another markdown.', {cooldown_days: cooldownDays});
-  if (input.qualified_views < minimumViews) return noMarkdown('There is not enough qualified traffic to interpret demand.', {minimum_qualified_views: minimumViews});
   if (input.recent_checkout_starts > 0) return noMarkdown('Recent checkout activity suggests reviewing checkout friction before lowering the price.');
+  if (input.seller_floor_cents <= 0) return noMarkdown('Set a positive seller price floor before requesting a markdown recommendation.');
+  if (input.seller_floor_cents >= input.original_price_cents) {
+    return noMarkdown('The seller-defined price floor leaves no room for a markdown from the original listing price.');
+  }
 
-  let percent = input.listing_age_days >= 180 ? 15 : input.listing_age_days >= 90 ? 12 : input.listing_age_days >= 60 ? 8 : 5;
-  if (input.recent_carts > 0) percent -= 3;
-  if (input.recent_inquiries > 0) percent -= 2;
-  percent = Math.max(0, Math.min(percent, maximumPercent));
-  if (!percent) return noMarkdown('Recent buyer engagement does not support a markdown at this time.');
-
-  const maximumFloorPercent = Math.floor(((input.current_price_cents - input.seller_floor_cents) * 100) / input.current_price_cents);
-  percent = Math.min(percent, maximumFloorPercent);
-  if (!percent) return noMarkdown('The seller-defined price floor leaves no room for a markdown.');
-  const proposed = Math.max(
-    input.seller_floor_cents,
-    Math.round(input.current_price_cents * (100 - percent) / 100)
+  const targetPercent = Math.min(
+    input.listing_age_days >= 135 ? 15 : input.listing_age_days >= 90 ? 10 : 5,
+    maximumPercent
   );
+  const scheduledPrice = Math.round(input.original_price_cents * (100 - targetPercent) / 100);
+  const maximumFloorPercent = Math.floor(
+    ((input.original_price_cents - input.seller_floor_cents) * 100) / input.original_price_cents
+  );
+  const effectivePercent = Math.min(targetPercent, maximumFloorPercent);
+  if (!effectivePercent) return noMarkdown('The seller-defined price floor leaves no room for a whole-percent markdown.');
+  const proposed = Math.round(input.original_price_cents * (100 - effectivePercent) / 100);
+  if (input.current_price_cents <= proposed) {
+    return noMarkdown('The current price is already at or below the scheduled target from the original listing price.', {
+      target_markdown_percent: targetPercent,
+      scheduled_price_cents: scheduledPrice
+    });
+  }
   return {
     status: 'suggested',
+    original_price_cents: input.original_price_cents,
     current_price_cents: input.current_price_cents,
     proposed_price_cents: proposed,
-    suggested_markdown_percent: percent,
+    suggested_markdown_percent: effectivePercent,
+    target_markdown_percent: targetPercent,
+    scheduled_price_cents: scheduledPrice,
     seller_floor_cents: input.seller_floor_cents,
     rationale: [
       `The listing has been active for ${input.listing_age_days} days.`,
-      `${input.qualified_views} qualified views provide enough demand evidence.`,
-      input.recent_carts || input.recent_inquiries ? 'Recent buyer engagement reduced the suggested markdown.' : 'No recent carts or inquiries reduced confidence in the current price.'
+      `The ${targetPercent}% schedule is anchored to the original listing price, not the latest reduced price.`,
+      `${input.qualified_views} provider-created checkout session${input.qualified_views === 1 ? '' : 's'} are recorded; this signal does not alter the age schedule.`,
+      proposed > scheduledPrice ? 'The seller-defined floor limited the scheduled markdown.' : 'The seller-defined floor permits the scheduled markdown.'
     ],
     seller_confirmation_required: true,
     automatic_price_change: false

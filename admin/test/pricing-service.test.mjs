@@ -8,7 +8,7 @@ const DAY = 86_400;
 const NOW = 1_800_000_000;
 const migrations = [
   '0001_legacy_inventory.sql','0002_private_image_objects.sql','0003_revisioned_catalog.sql',
-  '0004_settings_commands.sql','0005_listing_compliance.sql'
+  '0004_settings_commands.sql','0005_listing_compliance.sql','0006_ai_governance.sql'
 ].map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
 
 function database() {
@@ -33,6 +33,7 @@ function seedArtwork(sqlite, {
   height = 64,
   published = true,
   allowed = true,
+  sellerFloor = price == null ? 5_000 : Math.max(1, Math.floor(price * 0.75)),
   createdAt = NOW - (120 * DAY)
 }) {
   const artwork = `artwork-${suffix}`;
@@ -59,6 +60,8 @@ function seedArtwork(sqlite, {
   ) VALUES(?,?,?,'canonical-listing-v1','allow','deterministic','[]','[]','[]','test',?)`).run(
     `assessment-${suffix}`,artwork,revision,createdAt
   );
+  sqlite.prepare(`INSERT INTO catalog_listing_price_floors(id,artwork_id,seller_floor_cents,actor,created_at)
+    VALUES(?,?,?,'test',?)`).run(`floor-${suffix}`,artwork,sellerFloor,createdAt);
   return {artwork,revision};
 }
 
@@ -144,7 +147,7 @@ test('initial guidance uses only verified paid, genuinely similar internal sales
   seedOrder(sqlite,{suffix:'paid-3',artwork:target.artwork,revision:target.revision,price:12_000});
   seedOrder(sqlite,{suffix:'pending',artwork:target.artwork,revision:target.revision,price:90_000,status:'pending'});
   seedOrder(sqlite,{suffix:'unrelated',artwork:target.artwork,revision:target.revision,price:99_000,category:'Furniture',objectKind:'other',width:800,height:640});
-  const result = await getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,seller_floor_cents:0,now_seconds:NOW});
+  const result = await getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,now_seconds:NOW});
   assert.equal(result.initial.status,'suggested');
   assert.equal(result.initial.comparable_count,3);
   assert.deepEqual([result.initial.low_cents,result.initial.midpoint_cents,result.initial.high_cents],[8_000,10_000,12_000]);
@@ -166,38 +169,52 @@ test('initial range can price a new sale draft before a current price exists', a
   assert.match(result.markdown.reason,/positive current price/i);
 });
 
+test('initial price guidance never recommends below the persisted seller floor', async () => {
+  const {sqlite,DB} = database();
+  const target = seedArtwork(sqlite,{suffix:'target-floor-above-market',price:null,published:false,sellerFloor:12_000});
+  seedOrder(sqlite,{suffix:'floor-market-1',artwork:target.artwork,revision:target.revision,price:7_500});
+  seedOrder(sqlite,{suffix:'floor-market-2',artwork:target.artwork,revision:target.revision,price:9_000});
+  seedOrder(sqlite,{suffix:'floor-market-3',artwork:target.artwork,revision:target.revision,price:11_000});
+  const result = await getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,now_seconds:NOW});
+  assert.equal(result.initial.status,'no_recommendation');
+  assert.equal(result.initial.seller_floor_cents,12_000);
+  assert.deepEqual(result.initial.market_range,{low_cents:7_500,midpoint_cents:9_000,high_cents:11_000});
+  assert.match(result.initial.reason,/below the saved seller floor/i);
+});
+
 test('price guidance fails closed without an exact active-policy allowance', async () => {
   const {sqlite,DB} = database();
   const target = seedArtwork(sqlite,{suffix:'target-held',allowed:false});
   await assert.rejects(
-    () => getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,seller_floor_cents:0,now_seconds:NOW}),
+    () => getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,now_seconds:NOW}),
     (error) => error.status===409 && error.details?.code==='COMPLIANCE_REQUIRED'
   );
 });
 
-test('insufficient sales and demand evidence returns honest no-recommendation states', async () => {
+test('insufficient comparable sales remains honest while age guidance has no hidden traffic gate', async () => {
   const {sqlite,DB} = database();
-  const target = seedArtwork(sqlite,{suffix:'target-insufficient'});
-  const result = await getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,seller_floor_cents:0,now_seconds:NOW});
+  const target = seedArtwork(sqlite,{suffix:'target-insufficient',sellerFloor:9_000});
+  const result = await getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,now_seconds:NOW});
   assert.equal(result.initial.status,'insufficient_evidence');
   assert.equal(result.initial.comparable_count,0);
-  assert.equal(result.markdown.status,'no_recommendation');
-  assert.match(result.markdown.reason,/enough qualified traffic/i);
+  assert.equal(result.markdown.status,'suggested');
+  assert.equal(result.markdown.proposed_price_cents,9_000);
   assert.equal(result.evidence.qualified_demand_events,0);
   assert.equal(result.evidence.inquiries_tracked,false);
 });
 
 test('stale-listing markdown uses saved demand evidence, respects seller floor, and writes nothing', async () => {
   const {sqlite,DB} = database();
-  const target = seedArtwork(sqlite,{suffix:'target-stale',price:10_000,createdAt:NOW-(120*DAY)});
+  const target = seedArtwork(sqlite,{suffix:'target-stale',price:10_000,sellerFloor:9_500,createdAt:NOW-(120*DAY)});
   for(let index=0;index<20;index++) seedPaymentSession(sqlite,{
     suffix:`demand-${String(index).padStart(2,'0')}`,artwork:target.artwork,revision:target.revision,createdAt:NOW-(40*DAY)-index,price:10_000
   });
   const before = Number(sqlite.prepare('SELECT total_changes() AS n').get().n);
-  const result = await getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,seller_floor_cents:9_500,now_seconds:NOW});
+  const result = await getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,now_seconds:NOW});
   const after = Number(sqlite.prepare('SELECT total_changes() AS n').get().n);
   assert.equal(result.markdown.status,'suggested');
   assert.equal(result.markdown.suggested_markdown_percent,5);
+  assert.equal(result.markdown.target_markdown_percent,10);
   assert.equal(result.markdown.proposed_price_cents,9_500);
   assert.equal(result.markdown.automatic_price_change,false);
   assert.equal(result.evidence.qualified_demand_events,20);
@@ -205,15 +222,33 @@ test('stale-listing markdown uses saved demand evidence, respects seller floor, 
   assert.equal(after,before);
 });
 
-test('ready quote requests alone cannot satisfy the markdown evidence threshold', async () => {
+test('ready quote requests remain reported evidence but do not gate the approved age schedule', async () => {
   const {sqlite,DB} = database();
-  const target = seedArtwork(sqlite,{suffix:'target-quotes-only',price:10_000,createdAt:NOW-(120*DAY)});
+  const target = seedArtwork(sqlite,{suffix:'target-quotes-only',price:10_000,sellerFloor:9_000,createdAt:NOW-(120*DAY)});
   for(let index=0;index<20;index++) seedQuote(sqlite,{
     suffix:`quote-only-${String(index).padStart(2,'0')}`,artwork:target.artwork,revision:target.revision,createdAt:NOW-(40*DAY)-index,price:10_000
   });
-  const result = await getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,seller_floor_cents:0,now_seconds:NOW});
-  assert.equal(result.markdown.status,'no_recommendation');
-  assert.match(result.markdown.reason,/qualified traffic/i);
+  const result = await getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,now_seconds:NOW});
+  assert.equal(result.markdown.status,'suggested');
+  assert.equal(result.markdown.proposed_price_cents,9_000);
   assert.equal(result.evidence.qualified_demand_events,0);
   assert.equal(result.evidence.recent_quote_requests,0);
+});
+
+test('republishing unchanged copy or photos does not reset the 30-day price-change cooldown', async () => {
+  const {sqlite,DB} = database();
+  const target = seedArtwork(sqlite,{suffix:'target-republished',price:10_000,sellerFloor:9_000,createdAt:NOW-(120*DAY)});
+  // Historical publish commands are seeded directly here so the test isolates
+  // pricing evidence rather than the separate publication-readiness guard.
+  sqlite.exec('DROP TRIGGER catalog_publish_guard');
+  const insert = sqlite.prepare(`INSERT INTO catalog_publish_commands(
+    id,artwork_id,revision_id,expected_head_version,quantity_changed,actor,created_at
+  ) VALUES(?,?,?,1,0,'test',?)`);
+  insert.run('publish-original',target.artwork,target.revision,NOW-(120*DAY));
+  insert.run('publish-copy-only',target.artwork,target.revision,NOW-DAY);
+  const result = await getListingPriceGuidance(DB,{artwork_id:target.artwork,revision_id:target.revision,now_seconds:NOW});
+  assert.equal(result.evidence.listing_age_days,120);
+  assert.equal(result.evidence.days_since_price_change,120);
+  assert.equal(result.markdown.status,'suggested');
+  assert.equal(result.markdown.proposed_price_cents,9_000);
 });

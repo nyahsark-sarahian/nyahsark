@@ -8,10 +8,13 @@ import {
   normalizeDisclosures,
   validateDisclosures
 } from './compliance.js';
+import {getPricingPreference, listReviewEscalations} from './listing-governance.js';
 
 const ADMIN_PAGE_SIZE = 10;
 const PUBLIC_PAGE_SIZE = 24;
 const MAX_CONFIGURATIONS = 100;
+const MADE_TO_ORDER_VALUES = new Set(['unknown', 'yes', 'no']);
+const PRODUCTION_METHOD_VALUES = new Set(['unknown', 'heat_press', 'sublimation', 'other']);
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,159}$/;
 
 const uuid = () => crypto.randomUUID();
@@ -65,6 +68,21 @@ export function validateDraftSnapshot(input) {
   const height = nullableInteger(draft.height_eighths, 1, 1000000, fields, 'height_eighths');
   if (typeof draft.offered_for_sale !== 'boolean') fieldError(fields, 'offered_for_sale', 'Choose display only or offered for sale.');
   const requestedPosition = nullableInteger(draft.requested_store_position, 1, 1000000, fields, 'requested_store_position');
+  const madeToOrder = draft.made_to_order === undefined || draft.made_to_order === null || draft.made_to_order === ''
+    ? 'unknown'
+    : draft.made_to_order;
+  const productionMethod = draft.production_method === undefined || draft.production_method === null || draft.production_method === ''
+    ? 'unknown'
+    : draft.production_method;
+  if (!MADE_TO_ORDER_VALUES.has(madeToOrder)) {
+    fieldError(fields, 'made_to_order', 'Choose whether this product is made to order.');
+  }
+  if (!PRODUCTION_METHOD_VALUES.has(productionMethod)) {
+    fieldError(fields, 'production_method', 'Choose a supported production method.');
+  }
+  if (madeToOrder === 'yes' && productionMethod === 'unknown') {
+    fieldError(fields, 'production_method', 'Choose how this made-to-order product will be produced.');
+  }
 
   const inventoryInput = draft.inventory && typeof draft.inventory === 'object' ? draft.inventory : {};
   const quantityChanged = inventoryInput.quantity_changed === true;
@@ -127,6 +145,8 @@ export function validateDraftSnapshot(input) {
     height_eighths: height,
     offered_for_sale: draft.offered_for_sale === true,
     requested_store_position: requestedPosition,
+    made_to_order: MADE_TO_ORDER_VALUES.has(madeToOrder) ? madeToOrder : 'unknown',
+    production_method: PRODUCTION_METHOD_VALUES.has(productionMethod) ? productionMethod : 'unknown',
     inventory: {quantity_changed: quantityChanged, intended_available_quantity: intended, captured_version: captured},
     photos,
     configurations,
@@ -192,6 +212,8 @@ async function resolveArtwork(database, identifier) {
 
 function assembleRevision(revision, photos, configurations, disclosure, visibility) {
   const snapshot = parseJson(revision.snapshot_json, {});
+  snapshot.made_to_order = MADE_TO_ORDER_VALUES.has(snapshot.made_to_order) ? snapshot.made_to_order : 'unknown';
+  snapshot.production_method = PRODUCTION_METHOD_VALUES.has(snapshot.production_method) ? snapshot.production_method : 'unknown';
   snapshot.compliance = normalizeDisclosures(disclosure
     ? {...disclosure, seller_attested: asBool(disclosure.seller_attested)}
     : snapshot.compliance);
@@ -257,10 +279,14 @@ async function revisionData(database, revisionId, visibility = 'admin') {
 
 async function hydrateAdmin(database, row, loaded = null) {
   const {revision, snapshot} = loaded || await revisionData(database, row.working_revision_id, 'admin');
-  const [complianceAssessment, aiSuggestion] = await Promise.all([
+  const [complianceAssessment, aiSuggestion, pricingPreference] = await Promise.all([
     getActiveAssessment(database, row.working_revision_id),
-    getLatestAiSuggestion(database, row.working_revision_id)
+    getLatestAiSuggestion(database, row.working_revision_id),
+    getPricingPreference(database, row.id)
   ]);
+  const reviewEscalations = complianceAssessment
+    ? await listReviewEscalations(database, complianceAssessment.id)
+    : [];
   return {
     id: row.id,
     stable_id: row.stable_id,
@@ -278,6 +304,8 @@ async function hydrateAdmin(database, row, loaded = null) {
     },
     store_position: row.store_position == null ? null : row.store_position + 1,
     compliance_assessment: complianceAssessment,
+    pricing_preference: pricingPreference,
+    review_escalations: reviewEscalations,
     ai_suggestion: aiSuggestion ? {
       ...aiSuggestion.suggestions,
       observations: aiSuggestion.observations,

@@ -25,6 +25,7 @@
   ],
   "vars": {
     "STAGING_ENABLED": "no",
+    "CALIBRATION_MODE": "no",
     "ADMIN_ORIGIN": "https://thearkadmin.nyahsark.com",
     "STOREFRONT_ORIGIN": "https://nyahsark.com",
     "SUPABASE_URL": "https://REPLACE.supabase.co",
@@ -32,9 +33,12 @@
     "SARAH_AUTH_SUB": "REPLACE_WITH_EXISTING_SUBJECT",
     "IMAGE_TRANSFORM_QUALIFIED": "no",
     "AI_ASSIST_ENABLED": "no",
-    "AI_ASSIST_MODEL": "",
+    "AI_ASSIST_MODEL": "@cf/meta/llama-4-scout-17b-16e-instruct",
     "AI_GATEWAY_ID": "",
-    "AI_ASSIST_JSON_MODE": "yes"
+    "AI_ASSIST_JSON_MODE": "yes",
+    "AI_MONTHLY_REQUEST_CAP": "100",
+    "AI_MONTHLY_BUDGET_CENTS": "500",
+    "AI_MAX_IMAGES_PER_ACTION": "4"
   }
 }
 

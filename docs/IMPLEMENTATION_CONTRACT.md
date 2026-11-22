@@ -67,9 +67,10 @@ Archive clears public visibility while retaining heads, revisions, assets, inven
 - `POST /api/admin/artworks/:id/publish` atomically switches the public revision, applies an intentional inventory adjustment with a captured inventory version, and inserts new public art into global order.
 - `POST /api/admin/artworks/:id/archive` and `/restore` are recoverable.
 - `POST /api/admin/artworks/:id/assist/draft-copy` returns editable copy and alt-text suggestions for the current saved revision. It does not save or publish them.
-- `POST /api/admin/artworks/:id/assist/price` returns advisory initial-price and listing-age guidance for the exact saved revision. It uses verified paid store orders, provider-created payment sessions as the qualified demand threshold, and ready quotes only as a weaker activity signal. It respects an optional seller floor and never writes a price.
+- `POST /api/admin/artworks/:id/assist/price` saves a required positive seller floor and returns advisory initial-price and listing-age guidance for the exact saved revision. Initial guidance uses verified paid store orders. Later reductions use the approved 45/90/135-day schedule from the original price, report provider-created payment sessions and ready quotes without covert visitor tracking, pause for a recent checkout, never compound, never cross the floor, and never write a price.
 - `POST /api/admin/artworks/:id/compliance/assess` records a versioned policy assessment. AI may supply bounded visual observations; deterministic policy code alone decides `allow`, `review`, or `block`.
 - `POST /api/admin/artworks/:id/compliance/review` appends a human review decision and note. Reviews are auditable, and only a `review` assessment can be approved.
+- `POST /api/admin/artworks/:id/compliance/escalate` appends a Sarah, local-priest, or diocesan consultation record for an ambiguous `review`. Human approval requires the latest local-priest or diocesan record to be cleared; the enforced sequence cannot approve or override a deterministic hard block.
 - `POST /api/admin/store-order` accepts staged moves plus the expected global order version.
 - `POST /api/admin/uploads` allocates a private expiring upload. `PUT /api/admin/uploads/:id` fully decodes/reencodes supported input and atomically attaches the successful replacement through a new working revision.
 - `GET /api/admin/media/:assetId/:role` serves authenticated private media with no-store.
@@ -111,9 +112,13 @@ The storefront Worker exposes only this public surface through its service bindi
 
 ## Listing Copilot boundary
 
-Listing Copilot is disabled unless its feature flag, Workers AI binding, and model are all configured. Only a sanitized display WebP and bounded saved-revision fields may reach the model. When AI Gateway is configured, request logging and caching are disabled for these calls.
+Listing Copilot is disabled unless its feature flag, Workers AI binding, and model are all configured. Production keeps the flag off until ten representative calibration listings pass review and the release owner deliberately enables it. Only a sanitized display WebP and bounded saved-revision fields may reach the model. When AI Gateway is configured, request logging and caching are disabled for these calls.
+
+Every AI action reserves capacity atomically before provider dispatch. The pilot permits at most four images per action, 100 image inferences per UTC month, and 500 cents of conservatively estimated monthly spend. Reservations and outcomes are append-only; inability to reserve or reconcile fails closed.
 
 Model output is untrusted, schema-constrained input to the application. It may describe visible features and propose editable listing copy, but it cannot authenticate an object, establish blessing, provenance, ownership, relic status, age, material, authorship, canonical permission, civil legality, or spiritual effect. Photo-only concern can cause human review, never an automatic hard block. Policy assessments, reviews, citations, model observations, and suggestions are append-only and revision-bound.
+
+Made-to-order status and production method are seller-controlled revision facts, not visual inferences. When a product is marked made to order, a known production method is required and Copilot output must identify the pictured item as a representative sample, preserve the saved method, and avoid stocked or ready-to-ship language. This supports draft preparation only. Checkout for made-to-order goods remains a separate sandbox gate until production-capacity, lead-time, and reservation semantics replace physical-stock assumptions; operators must not enter fictitious on-hand inventory.
 
 See [Listing Copilot policy](./LISTING_COPILOT_POLICY.md) for the decision boundary and source basis.
 

@@ -68,7 +68,7 @@ test('Listing Copilot collects disclosures and keeps AI wording suggestion-only'
     'provenance_known', 'ecclesiastical_owner', 'authenticity_document',
     'spiritual_benefit_priced', 'seller_attested',
   ]) assert.match(javascript, new RegExp(field));
-  for (const endpoint of ['assist/draft-copy', 'assist/price', 'compliance/assess', 'compliance/review']) assert.match(javascript, new RegExp(endpoint));
+  for (const endpoint of ['assist/draft-copy', 'assist/price', 'compliance/assess', 'compliance/review', 'compliance/escalate']) assert.match(javascript, new RegExp(endpoint));
   assert.match(javascript, /Applying suggestions changes only this unsaved form/i);
   assert.match(javascript, /A photograph cannot prove a blessing, provenance, or relic authenticity/i);
   assert.match(javascript, /assessment\?\.effective_decision \|\| assessment\?\.decision/);
@@ -81,7 +81,33 @@ test('Listing Copilot collects disclosures and keeps AI wording suggestion-only'
   assert.doesNotMatch(applyFunction, /sendJSON|saveCards|publishCard/);
   assert.match(javascript, /Guidance uses verified store sales and server-owned activity only/i);
   assert.match(javascript, /Applying guidance changes only the unsaved price field/i);
+  assert.match(javascript, /Seller-floor-adjusted range/);
+  assert.match(javascript, /latest recorded local-priest or diocesan consultation is cleared/);
+  assert.match(javascript, /assessmentChanged[\s\S]*?priceGuidance = null[\s\S]*?reviewNote = ''[\s\S]*?escalations = \[\]/);
+  assert.match(javascript, /escalationOutcome = 'requested'[\s\S]*?escalationReviewerRole = ''[\s\S]*?escalationNote = ''/);
+  assert.match(javascript, /permittedStage !== 'seller_clarification' \|\| value !== 'cleared'/);
   assert.match(javascript, /Sarah may override every suggestion/i);
+  assert.match(javascript, /made_to_order: 'unknown', production_method: 'unknown'/);
+  assert.match(javascript, /Made to order\?/);
+  assert.match(javascript, /Production method/);
+  assert.match(javascript, /representative sample; Listing Copilot must not describe it as stocked inventory/i);
+  assert.match(javascript, /draft\.made_to_order === 'yes' && draft\.production_method === 'unknown'/);
+  assert.match(javascript, /requestIds: \{copy: null, compliance: null\}/);
+  assert.match(javascript, /nyahsark:copilot-request:\$\{encodeURIComponent\(card\.id\)\}:\$\{card\.version\}:\$\{action\}/);
+  assert.match(javascript, /copilotRequestMemory\.set\(key, requestId\)/);
+  assert.match(javascript, /sessionStorage\.setItem\(key, requestId\)/);
+  assert.match(javascript, /sessionStorage\.getItem\(key\)/);
+  assert.match(javascript, /sessionStorage\.removeItem\(key\)/);
+  assert.match(javascript, /function pruneStaleCopilotRequestIds[\s\S]*?sessionStorage\.key\(index\)[\s\S]*?!current\.has\(key\)/);
+  assert.match(javascript, /const requestId = retainedCopilotRequestId\(card, 'copy'\)[\s\S]*?request_id: requestId/);
+  assert.match(javascript, /const requestId = retainedCopilotRequestId\(card, 'compliance'\)[\s\S]*?request_id: requestId/);
+  assert.match(javascript, /clearCopilotRequestIds\(card, 'copy'\)/);
+  assert.match(javascript, /clearCopilotRequestIds\(card, 'compliance'\)/);
+  assert.match(javascript, /function markDirty[\s\S]*?clearCopilotRequestIds\(card\)/);
+  assert.match(javascript, /Retry the same wording request/);
+  assert.match(javascript, /Retry the same canonical review/);
+  assert.match(javascript, /Start a new wording action/);
+  assert.match(javascript, /Start a new review action/);
   const applyPriceFunction = /function applyPriceGuidance[\s\S]*?\n}\n\nasync function submitHumanReview/.exec(javascript)?.[0] || '';
   assert.ok(applyPriceFunction);
   assert.match(applyPriceFunction, /card\._raw\.price = formatPriceInput\(cents\)/);

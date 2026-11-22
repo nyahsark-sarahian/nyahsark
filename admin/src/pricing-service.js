@@ -1,5 +1,6 @@
 import {HttpError} from './http.js';
 import {getActiveAssessment} from './compliance.js';
+import {getPricingPreference} from './listing-governance.js';
 import {suggestInitialPrice, suggestMarkdown} from './pricing-assist.js';
 
 const DAY_SECONDS = 86_400;
@@ -105,13 +106,31 @@ async function verifiedComparables(database, target, nowSeconds) {
 }
 
 async function listingEvidence(database, target, nowSeconds) {
-  const publication = await database.prepare(`SELECT min(created_at) AS first_published_at,
-    max(CASE WHEN revision_id=? THEN created_at END) AS revision_published_at
-    FROM catalog_publish_commands WHERE artwork_id=?`).bind(target.id, target.artwork_id).first();
+  const publication = await database.prepare(`WITH price_history AS (
+    SELECT p.id,p.revision_id,p.created_at,p.rowid AS command_rowid,r.base_price_cents,
+      lag(r.base_price_cents) OVER (ORDER BY p.created_at,p.rowid) AS previous_price_cents
+    FROM catalog_publish_commands p
+    JOIN catalog_artwork_revisions r ON r.id=p.revision_id
+    WHERE p.artwork_id=? AND r.offered_for_sale=1 AND r.base_price_cents BETWEEN 1 AND ?
+  )
+  SELECT min(created_at) AS first_published_at,
+    max(CASE WHEN revision_id=? THEN created_at END) AS revision_published_at,
+    (SELECT base_price_cents FROM price_history ORDER BY created_at,command_rowid LIMIT 1) AS original_price_cents,
+    max(CASE WHEN previous_price_cents IS NULL OR previous_price_cents<>base_price_cents THEN created_at END) AS last_price_changed_at
+  FROM price_history`).bind(target.artwork_id, MAX_CENTS, target.id).first();
   const isPublished = target.published_revision_id === target.id;
   const firstPublishedAt = isPublished ? Number(publication?.first_published_at ?? target.created_at) : null;
   const revisionPublishedAt = isPublished ? Number(publication?.revision_published_at ?? target.created_at) : null;
-  const priceChangedAt = isPublished ? Math.max(Number(target.created_at), revisionPublishedAt) : null;
+  const recordedPriceChangedAt = Number(publication?.last_price_changed_at);
+  const priceChangedAt = isPublished
+    ? (integer(recordedPriceChangedAt, 1) ? recordedPriceChangedAt : firstPublishedAt ?? Number(target.created_at))
+    : null;
+  const publishedOriginalPrice = Number(publication?.original_price_cents);
+  const originalPrice = integer(publishedOriginalPrice, 1, MAX_CENTS)
+    ? publishedOriginalPrice
+    : integer(Number(target.base_price_cents), 1, MAX_CENTS)
+      ? Number(target.base_price_cents)
+      : null;
   const recentSince = nowSeconds - (30 * DAY_SECONDS);
   const quoteActivity = await database.prepare(`SELECT
     count(DISTINCT CASE WHEN q.created_at>=? THEN q.id END) AS recent_quote_requests
@@ -130,6 +149,7 @@ async function listingEvidence(database, target, nowSeconds) {
     first_published_at: firstPublishedAt,
     current_revision_published_at: revisionPublishedAt,
     last_price_revision_at: priceChangedAt,
+    original_price_cents: originalPrice,
     listing_age_days: isPublished ? elapsedDays(nowSeconds, firstPublishedAt) : 0,
     days_since_price_change: isPublished ? elapsedDays(nowSeconds, priceChangedAt) : 0,
     qualified_demand_events: Number(checkoutActivity?.qualified_events ?? 0),
@@ -141,6 +161,35 @@ async function listingEvidence(database, target, nowSeconds) {
 }
 function unavailableMarkdown(reason) {
   return {status: 'no_recommendation', reason, automatic_price_change: false};
+}
+
+function enforceInitialSellerFloor(initial, sellerFloorCents) {
+  if (initial?.status !== 'suggested') return initial;
+  const marketRange = {
+    low_cents: initial.low_cents,
+    midpoint_cents: initial.midpoint_cents,
+    high_cents: initial.high_cents
+  };
+  if (initial.high_cents < sellerFloorCents) {
+    return {
+      status: 'no_recommendation',
+      reason: 'The verified comparable-sale range is below the saved seller floor; set the price manually or revisit the floor inputs.',
+      comparable_count: initial.comparable_count,
+      confidence: initial.confidence,
+      seller_floor_cents: sellerFloorCents,
+      market_range: marketRange,
+      seller_confirmation_required: true,
+      automatic_price_change: false
+    };
+  }
+  return {
+    ...initial,
+    market_range: marketRange,
+    seller_floor_cents: sellerFloorCents,
+    floor_applied: initial.low_cents < sellerFloorCents,
+    low_cents: Math.max(initial.low_cents, sellerFloorCents),
+    midpoint_cents: Math.max(initial.midpoint_cents, sellerFloorCents)
+  };
 }
 
 function relabelMarkdown(markdown) {
@@ -161,8 +210,14 @@ export async function getListingPriceGuidance(database, input = {}) {
   if (!integer(nowSeconds, 1)) throw new HttpError(400, 'Current time is invalid');
   const target = await targetRevision(database, artworkId, revisionId);
   const currentPrice = integer(target.base_price_cents, 1, MAX_CENTS) ? target.base_price_cents : null;
-  const floor = input.seller_floor_cents == null ? 0 : input.seller_floor_cents;
-  if (!integer(floor, 0, currentPrice ?? MAX_CENTS)) throw new HttpError(400, 'Seller price floor is invalid');
+  const pricingPreference = await getPricingPreference(database, artworkId);
+  if (!pricingPreference) {
+    throw new HttpError(409, 'Save a positive seller price floor before requesting price guidance', {code: 'PRICE_FLOOR_REQUIRED'});
+  }
+  const floor = pricingPreference.seller_floor_cents;
+  if (!integer(floor, 1, currentPrice ?? MAX_CENTS)) {
+    throw new HttpError(409, 'The saved seller price floor is no longer valid for the current price', {code: 'PRICE_FLOOR_INVALID'});
+  }
   const assessment = await getActiveAssessment(database, revisionId);
   if (!['allow', 'human_approved'].includes(assessment?.effective_decision)) {
     throw new HttpError(409, 'Canonical listing review must allow this exact revision before price guidance is available', {code: 'COMPLIANCE_REQUIRED'});
@@ -172,13 +227,14 @@ export async function getListingPriceGuidance(database, input = {}) {
     verifiedComparables(database, target, nowSeconds),
     listingEvidence(database, target, nowSeconds)
   ]);
-  const initial = suggestInitialPrice({comparables}, {nowSeconds});
+  const initial = enforceInitialSellerFloor(suggestInitialPrice({comparables}, {nowSeconds}), floor);
   let markdown = currentPrice == null
     ? unavailableMarkdown('Save a positive current price before requesting stale-listing guidance.')
     : unavailableMarkdown('Publish this exact revision before requesting stale-listing guidance.');
   if (demand.is_published && currentPrice != null) {
     markdown = relabelMarkdown(suggestMarkdown({
       compliance_decision: assessment.effective_decision,
+      original_price_cents: demand.original_price_cents,
       current_price_cents: currentPrice,
       seller_floor_cents: floor,
       listing_age_days: demand.listing_age_days,
@@ -199,6 +255,7 @@ export async function getListingPriceGuidance(database, input = {}) {
   return {
     initial,
     markdown,
+    pricing_preference: pricingPreference,
     evidence: {
       currency: 'USD',
       comparable_source: 'verified_paid_nyahs_ark_orders',

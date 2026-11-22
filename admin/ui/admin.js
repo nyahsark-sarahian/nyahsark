@@ -7,7 +7,15 @@ import {
 import {getAuth, privateImage, privateUpload} from './session.js';
 
 const $ = selector => document.querySelector(selector);
+const COPILOT_REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const copilotRequestMemory = new Map();
 const TRI_STATE_OPTIONS = [['unknown', 'Not yet confirmed'], ['no', 'No'], ['yes', 'Yes']];
+const PRODUCTION_METHOD_OPTIONS = [
+  ['unknown', 'Not yet specified'],
+  ['heat_press', 'Heat press'],
+  ['sublimation', 'Sublimation'],
+  ['other', 'Other'],
+];
 const OBJECT_KIND_OPTIONS = [
   ['unknown', 'Not yet confirmed'],
   ['ordinary_devotional', 'Ordinary devotional artwork or object'],
@@ -78,6 +86,7 @@ function emptyDraft() {
   return {
     title: '', description: '', category: null, base_price_cents: null,
     width_eighths: null, height_eighths: null, offered_for_sale: false,
+    made_to_order: 'unknown', production_method: 'unknown',
     requested_store_position: null,
     inventory: {quantity_changed: false, intended_available_quantity: null, captured_version: 0},
     photos: [], configurations: [], compliance: emptyCompliance(),
@@ -109,6 +118,8 @@ function normalizeConfiguration(configuration) {
 function normalizeCard(raw = {}) {
   const source = raw.working_revision?.snapshot || raw.working?.snapshot || raw.draft || raw.snapshot || raw.working_revision || raw.working || raw;
   const draft = {...emptyDraft(), ...clone(source)};
+  draft.made_to_order = new Set(TRI_STATE_OPTIONS.map(([value]) => value)).has(source.made_to_order) ? source.made_to_order : 'unknown';
+  draft.production_method = new Set(PRODUCTION_METHOD_OPTIONS.map(([value]) => value)).has(source.production_method) ? source.production_method : 'unknown';
   draft.inventory = {...emptyDraft().inventory, ...(source.inventory || {})};
   draft.compliance = normalizeCompliance(source.compliance);
   draft.photos = (source.photos || []).map(normalizePhoto).sort((a, b) => a.position - b.position).map((photo, index) => ({...photo, position: index}));
@@ -135,10 +146,22 @@ function normalizeCard(raw = {}) {
       assessment: raw.compliance_assessment || raw.assistance?.assessment || null,
       suggestion: raw.ai_suggestion || raw.assistance?.suggestion || null,
       priceGuidance: null,
-      priceFloor: '',
+      priceFloor: Number.isSafeInteger(raw.pricing_preference?.seller_floor_cents)
+        ? formatPriceInput(raw.pricing_preference.seller_floor_cents)
+        : '',
+      requestIds: {copy: null, compliance: null},
       message: '',
       busy: false,
       reviewNote: '',
+      escalationStage: 'seller_clarification',
+      escalationOutcome: 'requested',
+      escalationReviewerRole: '',
+      escalationNote: '',
+      escalations: Array.isArray(raw.review_escalations)
+        ? clone(raw.review_escalations)
+        : Array.isArray(raw.compliance_assessment?.escalations)
+          ? clone(raw.compliance_assessment.escalations)
+          : [],
     },
     _raw: {
       price: formatPriceInput(draft.base_price_cents),
@@ -162,6 +185,7 @@ function setSaveState(card, value, cardNode) {
 }
 
 function markDirty(card, cardNode) {
+  clearCopilotRequestIds(card);
   card.dirty = true;
   setSaveState(card, 'unsaved', cardNode);
   $('#save-all').disabled = false;
@@ -198,6 +222,9 @@ function serializeCard(card) {
   draft.category = draft.category?.trim() || null;
   draft.title = draft.title.trim();
   draft.description = draft.description.trim();
+  if (draft.made_to_order === 'yes' && draft.production_method === 'unknown') {
+    errors.production_method = 'Choose how this made-to-order product will be produced.';
+  }
   draft.compliance = normalizeCompliance(draft.compliance);
   draft.photos = draft.photos.map(({asset_id, alt, position, is_main}) => ({asset_id, alt: String(alt || '').trim(), position, is_main: is_main === true}));
   if (draft.photos.length > MAX_PHOTOS) errors.photos = 'An artwork may have at most four photos.';
@@ -353,7 +380,10 @@ async function uploadFiles(card, cardNode, files, replaceAssetId = null, progres
         const node = progressNode || cardNode.querySelector('.progress');
         if (node) node.textContent = `${file.name}: ${percent}%`;
       });
-      if (result.artwork) Object.assign(card, normalizeCard(result.artwork));
+      if (result.artwork) {
+        clearCopilotRequestIds(card);
+        Object.assign(card, normalizeCard(result.artwork));
+      }
       else {
         if (result.asset) {
           const newPhoto = normalizePhoto({...result.asset, is_main: replaceAssetId ? card.draft.photos.find(photo => photo.asset_id === replaceAssetId)?.is_main : card.draft.photos.length === 0}, 0);
@@ -361,6 +391,7 @@ async function uploadFiles(card, cardNode, files, replaceAssetId = null, progres
           if (index >= 0) card.draft.photos[index] = newPhoto; else card.draft.photos.push(newPhoto);
           normalizePhotoOrder(card);
         }
+        clearCopilotRequestIds(card);
         card.version = result.version ?? card.version + 1;
       }
       card.dirty = false; setSaveState(card, 'saved', cardNode);
@@ -476,6 +507,99 @@ function copilotUnavailableMessage(error) {
   return error?.message || 'Listing Copilot could not complete the request. No draft fields were changed.';
 }
 
+function copilotRequestIds(card) {
+  if (!card.copilot.requestIds || typeof card.copilot.requestIds !== 'object') {
+    card.copilot.requestIds = {copy: null, compliance: null};
+  }
+  pruneStaleCopilotRequestIds(card);
+  for (const action of ['copy', 'compliance']) {
+    if (!COPILOT_REQUEST_ID.test(card.copilot.requestIds[action] || '')) {
+      card.copilot.requestIds[action] = readCopilotRequestId(card, action);
+    }
+  }
+  return card.copilot.requestIds;
+}
+
+function pruneStaleCopilotRequestIds(card) {
+  if (!card.id || !Number.isSafeInteger(card.version)) return;
+  const prefix = `nyahsark:copilot-request:${encodeURIComponent(card.id)}:`;
+  const current = new Set(['copy', 'compliance'].map(action => `${prefix}${card.version}:${action}`));
+  for (const key of copilotRequestMemory.keys()) {
+    if (key.startsWith(prefix) && !current.has(key)) copilotRequestMemory.delete(key);
+  }
+  try {
+    const stale = [];
+    for (let index = 0; index < sessionStorage.length; index += 1) {
+      const key = sessionStorage.key(index);
+      if (key?.startsWith(prefix) && !current.has(key)) stale.push(key);
+    }
+    for (const key of stale) sessionStorage.removeItem(key);
+  } catch {}
+}
+
+function copilotRequestStorageKey(card, action) {
+  if (!card.id || !Number.isSafeInteger(card.version) || !['copy', 'compliance'].includes(action)) return null;
+  return `nyahsark:copilot-request:${encodeURIComponent(card.id)}:${card.version}:${action}`;
+}
+
+function readCopilotRequestId(card, action) {
+  const key = copilotRequestStorageKey(card, action);
+  if (!key) return null;
+  const remembered = copilotRequestMemory.get(key);
+  if (COPILOT_REQUEST_ID.test(remembered || '')) return remembered;
+  try {
+    const stored = sessionStorage.getItem(key);
+    if (COPILOT_REQUEST_ID.test(stored || '')) {
+      copilotRequestMemory.set(key, stored);
+      return stored;
+    }
+  } catch {}
+  return null;
+}
+
+function writeCopilotRequestId(card, action, requestId) {
+  const key = copilotRequestStorageKey(card, action);
+  if (!key || !COPILOT_REQUEST_ID.test(requestId || '')) return;
+  copilotRequestMemory.set(key, requestId);
+  try { sessionStorage.setItem(key, requestId); } catch {}
+}
+
+function removeCopilotRequestId(card, action) {
+  const key = copilotRequestStorageKey(card, action);
+  if (!key) return;
+  copilotRequestMemory.delete(key);
+  try { sessionStorage.removeItem(key); } catch {}
+}
+
+function retainedCopilotRequestId(card, action) {
+  const requests = copilotRequestIds(card);
+  requests[action] ||= uuid();
+  writeCopilotRequestId(card, action, requests[action]);
+  return requests[action];
+}
+
+function clearCopilotRequestIds(card, action = null) {
+  const requests = copilotRequestIds(card);
+  if (action) {
+    removeCopilotRequestId(card, action);
+    requests[action] = null;
+  }
+  else {
+    removeCopilotRequestId(card, 'copy');
+    removeCopilotRequestId(card, 'compliance');
+    requests.copy = null;
+    requests.compliance = null;
+  }
+}
+
+function startNewCopilotAction(card, action) {
+  clearCopilotRequestIds(card, action);
+  card.copilot.message = action === 'copy'
+    ? 'The retained wording request was cleared. The next request will be a new AI action.'
+    : 'The retained review request was cleared. The next review will be a new AI action.';
+  renderCards();
+}
+
 function copilotReady(card) {
   return Boolean(card.id) && !card.dirty && card.state !== 'archived' && !card.copilot.busy;
 }
@@ -488,10 +612,15 @@ async function requestCopySuggestion(card) {
   }
   card.copilot.busy = true;
   card.copilot.message = 'Preparing editable wording suggestions…';
+  const requestId = retainedCopilotRequestId(card, 'copy');
   renderCards();
   try {
-    const result = await sendJSON(`/api/admin/artworks/${encodeURIComponent(card.id)}/assist/draft-copy`, 'POST', {expected_version: card.version});
+    const result = await sendJSON(`/api/admin/artworks/${encodeURIComponent(card.id)}/assist/draft-copy`, 'POST', {
+      expected_version: card.version,
+      request_id: requestId,
+    });
     card.copilot.suggestion = normalizeCopySuggestion(result);
+    clearCopilotRequestIds(card, 'copy');
     card.copilot.message = result.message || 'Suggestions are ready. Nothing has been saved or published.';
     announce('Listing wording suggestions are ready for review.');
   } catch (error) {
@@ -511,11 +640,27 @@ async function requestComplianceAssessment(card) {
   }
   card.copilot.busy = true;
   card.copilot.message = 'Checking the saved revision against the canonical listing policy…';
+  const requestId = retainedCopilotRequestId(card, 'compliance');
   renderCards();
   try {
-    const result = await sendJSON(`/api/admin/artworks/${encodeURIComponent(card.id)}/compliance/assess`, 'POST', {expected_version: card.version});
-    card.copilot.assessment = result.assessment || result.compliance_assessment || result;
+    const result = await sendJSON(`/api/admin/artworks/${encodeURIComponent(card.id)}/compliance/assess`, 'POST', {
+      expected_version: card.version,
+      request_id: requestId,
+    });
+    const nextAssessment = result.assessment || result.compliance_assessment || result;
+    const assessmentChanged = card.copilot.assessment?.id !== nextAssessment?.id;
+    card.copilot.assessment = nextAssessment;
+    if (assessmentChanged) {
+      card.copilot.priceGuidance = null;
+      card.copilot.reviewNote = '';
+      card.copilot.escalationStage = 'seller_clarification';
+      card.copilot.escalationOutcome = 'requested';
+      card.copilot.escalationReviewerRole = '';
+      card.copilot.escalationNote = '';
+      card.copilot.escalations = [];
+    }
     if (result.suggestion) card.copilot.suggestion = normalizeCopySuggestion(result);
+    clearCopilotRequestIds(card, 'compliance');
     card.copilot.message = result.message || 'Canonical review completed for this saved revision.';
     announce('Canonical listing review completed.');
   } catch (error) {
@@ -551,11 +696,11 @@ async function requestPriceGuidance(card) {
     renderCards();
     return;
   }
-  let floor = null;
+  let floor;
   try {
-    floor = parsePriceCents(card.copilot.priceFloor, {allowBlank: true});
+    floor = parsePriceCents(card.copilot.priceFloor, {allowBlank: false, positive: true});
     const current = parsePriceCents(card._raw.price, {allowBlank: true, positive: true});
-    if (current !== null && floor !== null && floor > current) throw new Error('Seller floor cannot be higher than the saved price.');
+    if (current !== null && floor > current) throw new Error('Seller floor cannot be higher than the saved price.');
   } catch (error) {
     card.copilot.message = error.message;
     renderCards();
@@ -570,6 +715,9 @@ async function requestPriceGuidance(card) {
       seller_floor_cents: floor,
     });
     card.copilot.priceGuidance = normalizePriceGuidance(result);
+    if (Number.isSafeInteger(result.pricing_preference?.seller_floor_cents)) {
+      card.copilot.priceFloor = formatPriceInput(result.pricing_preference.seller_floor_cents);
+    }
     card.copilot.message = result.message || 'Advisory price guidance is ready. No price was changed.';
     announce('Advisory price guidance is ready for review.');
   } catch (error) {
@@ -612,6 +760,51 @@ async function submitHumanReview(card, decision) {
     card.copilot.reviewNote = '';
     card.copilot.message = result.message || 'Human review decision recorded in the audit history.';
     announce('Human compliance review recorded.');
+  } catch (error) {
+    card.copilot.message = copilotUnavailableMessage(error);
+    announce(card.copilot.message, true);
+  } finally {
+    card.copilot.busy = false;
+    renderCards();
+  }
+}
+
+async function submitReviewEscalation(card) {
+  const note = card.copilot.escalationNote.trim();
+  const reviewerRole = card.copilot.escalationReviewerRole.trim();
+  if (reviewerRole.length < 2) {
+    card.copilot.message = 'Enter who provided or requested the consultation.';
+    renderCards();
+    return;
+  }
+  if (note.length < 8) {
+    card.copilot.message = 'Enter a consultation note of at least 8 characters.';
+    renderCards();
+    return;
+  }
+  if (!copilotReady(card) || !card.copilot.assessment) {
+    card.copilot.message = 'Save the current draft and run canonical review before recording a consultation.';
+    renderCards();
+    return;
+  }
+  card.copilot.busy = true;
+  card.copilot.message = 'Recording the consultation in the compliance history…';
+  renderCards();
+  try {
+    const result = await sendJSON(`/api/admin/artworks/${encodeURIComponent(card.id)}/compliance/escalate`, 'POST', {
+      expected_version: card.version,
+      stage: card.copilot.escalationStage,
+      outcome: card.copilot.escalationOutcome,
+      reviewer_role: reviewerRole,
+      note,
+    });
+    if (Array.isArray(result.escalations)) card.copilot.escalations = result.escalations;
+    else if (result.escalation) card.copilot.escalations = [...card.copilot.escalations, result.escalation];
+    card.copilot.escalationOutcome = 'requested';
+    card.copilot.escalationReviewerRole = '';
+    card.copilot.escalationNote = '';
+    card.copilot.message = result.message || 'Consultation recorded in the compliance history.';
+    announce('Compliance consultation recorded.');
   } catch (error) {
     card.copilot.message = copilotUnavailableMessage(error);
     announce(card.copilot.message, true);
@@ -676,16 +869,24 @@ function renderPriceGuidance(card, container) {
   );
   const controls = el('div', null, {class: 'pricing-controls'});
   const floor = el('input', null, {
-    type: 'text', inputMode: 'decimal', placeholder: 'Optional', value: card.copilot.priceFloor || '', disabled: !copilotReady(card),
+    type: 'text', inputMode: 'decimal', placeholder: 'Required', value: card.copilot.priceFloor || '', disabled: !copilotReady(card), required: true,
   });
-  floor.addEventListener('input', () => { card.copilot.priceFloor = floor.value; });
   const request = el('button', card.copilot.busy ? 'Working…' : 'Get price guidance', {
-    type: 'button', class: 'secondary',
-    disabled: !copilotReady(card) || !['allow', 'human_approved'].includes(effectiveComplianceDecision(card)),
+    type: 'button', class: 'secondary', disabled: true,
   });
+  const updateRequestButton = () => {
+    let validFloor = false;
+    try { validFloor = parsePriceCents(card.copilot.priceFloor, {allowBlank: false, positive: true}) > 0; } catch { validFloor = false; }
+    request.disabled = !copilotReady(card) || !validFloor || !['allow', 'human_approved'].includes(effectiveComplianceDecision(card));
+  };
+  floor.addEventListener('input', () => { card.copilot.priceFloor = floor.value; updateRequestButton(); });
   request.addEventListener('click', () => void requestPriceGuidance(card));
-  controls.append(inputLabel('Seller floor (USD, optional)', floor), request);
-  wrapper.append(controls);
+  updateRequestButton();
+  controls.append(inputLabel('Seller floor (USD, required)', floor), request);
+  wrapper.append(
+    controls,
+    el('p', 'Enter the minimum Sarah is willing to accept after item costs, packing, seller-paid fees, and desired profit. It is saved as an audited pricing preference when guidance is requested.', {class: 'help'}),
+  );
   if (!['allow', 'human_approved'].includes(effectiveComplianceDecision(card))) {
     wrapper.append(el('p', 'Complete canonical listing review for this saved revision before requesting price guidance.', {class: 'help'}));
   }
@@ -696,10 +897,18 @@ function renderPriceGuidance(card, container) {
     const markdown = guidance.markdown;
     const results = el('div', null, {class: 'pricing-results'});
     const initialPanel = el('div', null, {class: 'pricing-result'});
-    initialPanel.append(el('strong', 'Initial price range'));
+    initialPanel.append(el('strong', 'Initial price guidance'));
     if (initial?.status === 'suggested' && Number.isSafeInteger(initial.low_cents) && Number.isSafeInteger(initial.midpoint_cents) && Number.isSafeInteger(initial.high_cents)) {
+      const market = initial.market_range;
+      if (initial.floor_applied && Number.isSafeInteger(market?.low_cents) && Number.isSafeInteger(market?.midpoint_cents) && Number.isSafeInteger(market?.high_cents)) {
+        initialPanel.append(
+          el('p', `Verified comparable market range: ${money(market.low_cents)}–${money(market.high_cents)}; midpoint ${money(market.midpoint_cents)}.`, {class: 'help'}),
+          el('p', `Seller-floor-adjusted range: ${money(initial.low_cents)}–${money(initial.high_cents)}; midpoint ${money(initial.midpoint_cents)}.`),
+        );
+      } else {
+        initialPanel.append(el('p', `Verified comparable market range: ${money(initial.low_cents)}–${money(initial.high_cents)}; midpoint ${money(initial.midpoint_cents)}.`));
+      }
       initialPanel.append(
-        el('p', `${money(initial.low_cents)}–${money(initial.high_cents)}; midpoint ${money(initial.midpoint_cents)}.`),
         el('p', `${initial.comparable_count || 0} verified comparable sale${initial.comparable_count === 1 ? '' : 's'} · ${String(initial.confidence || 'low')} confidence.`, {class: 'help'}),
       );
       const apply = el('button', `Apply ${money(initial.midpoint_cents)} midpoint`, {type: 'button', class: 'secondary'});
@@ -707,6 +916,10 @@ function renderPriceGuidance(card, container) {
       initialPanel.append(apply);
     } else {
       initialPanel.append(el('p', initial?.reason || 'There is not enough verified comparable-sale evidence yet.', {class: 'help'}));
+      const market = initial?.market_range;
+      if (Number.isSafeInteger(market?.low_cents) && Number.isSafeInteger(market?.midpoint_cents) && Number.isSafeInteger(market?.high_cents)) {
+        initialPanel.append(el('p', `Verified comparable market range: ${money(market.low_cents)}–${money(market.high_cents)}; midpoint ${money(market.midpoint_cents)}. Saved floor: ${money(initial.seller_floor_cents)}.`, {class: 'help'}));
+      }
     }
     const markdownPanel = el('div', null, {class: 'pricing-result'});
     markdownPanel.append(el('strong', 'Listing-age adjustment'));
@@ -756,9 +969,14 @@ function renderAssessment(card, container) {
 
 function renderListingCopilot(card, cardNode) {
   card.draft.compliance = normalizeCompliance(card.draft.compliance);
-  card.copilot ||= {assessment: null, suggestion: null, priceGuidance: null, priceFloor: '', message: '', busy: false, reviewNote: ''};
+  card.copilot ||= {assessment: null, suggestion: null, priceGuidance: null, priceFloor: '', message: '', busy: false, reviewNote: '', escalationStage: 'seller_clarification', escalationOutcome: 'requested', escalationReviewerRole: '', escalationNote: '', escalations: []};
   card.copilot.priceGuidance ??= null;
   card.copilot.priceFloor ??= '';
+  card.copilot.escalationStage ??= 'seller_clarification';
+  card.copilot.escalationOutcome ??= 'requested';
+  card.copilot.escalationReviewerRole ??= '';
+  card.copilot.escalationNote ??= '';
+  card.copilot.escalations = Array.isArray(card.copilot.escalations) ? card.copilot.escalations : [];
   const section = el('section', null, {class: 'card-section copilot-panel'});
   section.append(
     el('h3', 'Listing Copilot'),
@@ -802,11 +1020,23 @@ function renderListingCopilot(card, cardNode) {
   if (unavailableReason) section.append(el('p', unavailableReason, {class: 'help copilot-prerequisite'}));
 
   const actions = el('div', null, {class: 'copilot-actions'});
-  const suggest = el('button', card.copilot.busy ? 'Working…' : 'Draft description and alt text', {type: 'button', class: 'secondary', disabled: !copilotReady(card)});
+  const retainedRequests = copilotRequestIds(card);
+  const suggest = el('button', card.copilot.busy ? 'Working…' : retainedRequests.copy ? 'Retry the same wording request' : 'Draft description and alt text', {type: 'button', class: 'secondary', disabled: !copilotReady(card)});
   suggest.addEventListener('click', () => void requestCopySuggestion(card));
-  const assess = el('button', card.copilot.busy ? 'Working…' : 'Run canonical listing review', {type: 'button', class: 'secondary', disabled: !copilotReady(card)});
+  const assess = el('button', card.copilot.busy ? 'Working…' : retainedRequests.compliance ? 'Retry the same canonical review' : 'Run canonical listing review', {type: 'button', class: 'secondary', disabled: !copilotReady(card)});
   assess.addEventListener('click', () => void requestComplianceAssessment(card));
-  actions.append(suggest, assess); section.append(actions);
+  actions.append(suggest, assess);
+  if (retainedRequests.copy) {
+    const newCopy = el('button', 'Start a new wording action', {type: 'button', class: 'secondary', disabled: card.copilot.busy});
+    newCopy.addEventListener('click', () => startNewCopilotAction(card, 'copy'));
+    actions.append(newCopy);
+  }
+  if (retainedRequests.compliance) {
+    const newCompliance = el('button', 'Start a new review action', {type: 'button', class: 'secondary', disabled: card.copilot.busy});
+    newCompliance.addEventListener('click', () => startNewCopilotAction(card, 'compliance'));
+    actions.append(newCompliance);
+  }
+  section.append(actions);
 
   if (card.copilot.message) section.append(el('p', card.copilot.message, {class: 'copilot-message', role: 'status', ariaLive: 'polite'}));
   renderCopySuggestion(card, section);
@@ -823,7 +1053,9 @@ function renderListingCopilot(card, cardNode) {
   const currentDecision = String(card.copilot.assessment?.effective_decision || card.copilot.assessment?.decision || card.copilot.assessment?.status || 'not_checked').toLowerCase();
   const updateReviewButtons = () => {
     const disabled = !copilotReady(card) || card.copilot.reviewNote.trim().length < 8 || !card.copilot.assessment;
-    approve.disabled = disabled || currentDecision !== 'review';
+    const latestConsultation = card.copilot.escalations.at(-1);
+    const priestCleared = ['local_priest', 'diocesan_chancery'].includes(latestConsultation?.stage) && latestConsultation?.outcome === 'cleared';
+    approve.disabled = disabled || currentDecision !== 'review' || !priestCleared;
     requestInfo.disabled = disabled; block.disabled = disabled;
   };
   note.addEventListener('input', () => { card.copilot.reviewNote = note.value; updateReviewButtons(); });
@@ -832,8 +1064,87 @@ function renderListingCopilot(card, cardNode) {
   block.addEventListener('click', () => void submitHumanReview(card, 'block'));
   reviewActions.append(approve, requestInfo, block); updateReviewButtons();
   review.append(inputLabel('Review / appeal note', note), reviewActions);
+  if (currentDecision === 'review') review.append(el('p', 'Approval becomes available only when the latest recorded local-priest or diocesan consultation is cleared.', {class: 'help'}));
   if (currentDecision === 'block') review.append(el('p', 'A hard block for an explicit relic sale or priced spiritual benefit cannot be overridden. The note can document an appeal or corrected evidence for a new revision.', {class: 'help'}));
   review.append(el('p', 'Human decisions are recorded separately from AI observations and should cite the evidence reviewed.', {class: 'help'}));
+
+  const escalation = el('section', null, {class: 'copilot-escalation', ariaLabel: 'Canon-law consultation record'});
+  escalation.append(
+    el('h5', 'Record a consultation'),
+    el('p', 'Use this record for Sarah’s clarification, a local priest’s consultation, or a diocesan referral. It records human consultation; it is not an AI canon-law judgment and cannot override a deterministic hard block.', {class: 'help'}),
+  );
+  const escalationFields = el('div', null, {class: 'escalation-fields'});
+  const latestEscalation = card.copilot.escalations.at(-1);
+  const terminalEscalation = ['cleared', 'blocked'].includes(latestEscalation?.outcome)
+    || (latestEscalation?.stage === 'diocesan_chancery' && ['escalated', 'unable_to_resolve'].includes(latestEscalation?.outcome));
+  let permittedStage = 'seller_clarification';
+  let consultationHelp = 'Begin by recording Sarah’s seller clarification.';
+  if (latestEscalation?.outcome === 'requested') {
+    permittedStage = latestEscalation.stage;
+    consultationHelp = 'Record the outcome of the requested consultation at the same stage.';
+  } else if (latestEscalation?.stage === 'seller_clarification' && ['escalated', 'unable_to_resolve'].includes(latestEscalation.outcome)) {
+    permittedStage = 'local_priest';
+    consultationHelp = 'The next permitted step is consultation with a local priest.';
+  } else if (latestEscalation?.stage === 'local_priest' && ['escalated', 'unable_to_resolve'].includes(latestEscalation.outcome)) {
+    permittedStage = 'diocesan_chancery';
+    consultationHelp = 'The next permitted step is the diocesan chancery or judicial vicar.';
+  } else if (terminalEscalation) {
+    permittedStage = latestEscalation.stage;
+    consultationHelp = latestEscalation.outcome === 'cleared'
+      ? 'The consultation is cleared; record the human review decision above.'
+      : 'This consultation history is final. Keep the listing held unless changed facts produce a new assessment.';
+  }
+  const consultationLocked = currentDecision !== 'review' || terminalEscalation;
+  card.copilot.escalationStage = permittedStage;
+  const stage = el('select');
+  for (const [value, label] of [
+    ['seller_clarification', 'Sarah clarification'],
+    ['local_priest', 'Local priest'],
+    ['diocesan_chancery', 'Diocesan chancery / judicial vicar'],
+  ]) stage.append(el('option', label, {value, selected: permittedStage === value, disabled: value !== permittedStage}));
+  stage.disabled = consultationLocked;
+  stage.addEventListener('change', () => { card.copilot.escalationStage = stage.value; });
+  const outcome = el('select');
+  const outcomeOptions = [
+    ['requested', 'Consultation requested'],
+    ['cleared', 'Cleared to continue review'],
+    ['blocked', 'Advised not to list'],
+    ['escalated', 'Escalated to next stage'],
+    ['unable_to_resolve', 'Unable to resolve'],
+  ].filter(([value]) => permittedStage !== 'seller_clarification' || value !== 'cleared');
+  if (!outcomeOptions.some(([value]) => value === card.copilot.escalationOutcome)) card.copilot.escalationOutcome = 'requested';
+  for (const [value, label] of outcomeOptions) outcome.append(el('option', label, {value, selected: card.copilot.escalationOutcome === value}));
+  outcome.disabled = consultationLocked;
+  outcome.addEventListener('change', () => { card.copilot.escalationOutcome = outcome.value; });
+  const reviewerRole = el('input', null, {type: 'text', maxLength: 160, value: card.copilot.escalationReviewerRole, placeholder: 'Example: local parish priest'});
+  reviewerRole.addEventListener('input', () => { card.copilot.escalationReviewerRole = reviewerRole.value; });
+  escalationFields.append(inputLabel('Consultation stage', stage), inputLabel('Outcome', outcome), inputLabel('Person or role', reviewerRole));
+  const escalationNote = el('textarea', null, {rows: 3, minLength: 8, maxLength: 4000, placeholder: 'Record what was asked, what evidence was considered, and the advice received.'});
+  escalationNote.value = card.copilot.escalationNote;
+  const recordEscalation = el('button', card.copilot.busy ? 'Working…' : 'Record consultation', {type: 'button', class: 'secondary'});
+  const updateEscalationButton = () => {
+    recordEscalation.disabled = consultationLocked || !copilotReady(card) || !card.copilot.assessment || card.copilot.escalationReviewerRole.trim().length < 2 || card.copilot.escalationNote.trim().length < 8;
+  };
+  reviewerRole.addEventListener('input', updateEscalationButton);
+  escalationNote.addEventListener('input', () => { card.copilot.escalationNote = escalationNote.value; updateEscalationButton(); });
+  recordEscalation.addEventListener('click', () => void submitReviewEscalation(card));
+  updateEscalationButton();
+  escalation.append(escalationFields, el('p', consultationHelp, {class: 'help'}), inputLabel('Consultation note', escalationNote), recordEscalation);
+  if (card.copilot.escalations.length) {
+    const history = el('ol', null, {class: 'escalation-history'});
+    for (const item of card.copilot.escalations) {
+      const stageLabel = String(item.stage || '').replaceAll('_', ' ');
+      const outcomeLabel = String(item.outcome || '').replaceAll('_', ' ');
+      const heading = [stageLabel, outcomeLabel, item.reviewer_role].filter(Boolean).join(' · ');
+      const entry = el('li');
+      entry.append(el('strong', heading || 'Consultation record'));
+      if (item.note) entry.append(el('p', String(item.note)));
+      if (Number.isSafeInteger(item.created_at)) entry.append(el('p', new Date(item.created_at * 1000).toLocaleString(), {class: 'help'}));
+      history.append(entry);
+    }
+    escalation.append(el('h6', 'Consultation history'), history);
+  }
+  review.append(escalation);
   section.append(review);
   return section;
 }
@@ -880,6 +1191,20 @@ function renderCard(card) {
   const sale = el('select'); sale.append(el('option', 'Display only', {value: 'display', selected: !card.draft.offered_for_sale}), el('option', 'Offered for sale', {value: 'sale', selected: card.draft.offered_for_sale}));
   sale.addEventListener('change', () => { card.draft.offered_for_sale = sale.value === 'sale'; markDirty(card, node); });
   commerce.append(inputLabel('Store availability', sale));
+  const production = el('section', null, {class: 'card-section'});
+  production.append(el('h3', 'Production details'));
+  const productionFields = el('div', null, {class: 'field-grid'});
+  const madeToOrder = el('select');
+  for (const [value, label] of TRI_STATE_OPTIONS) madeToOrder.append(el('option', label, {value, selected: card.draft.made_to_order === value}));
+  madeToOrder.addEventListener('change', () => { card.draft.made_to_order = madeToOrder.value; markDirty(card, node); });
+  const productionMethod = el('select');
+  for (const [value, label] of PRODUCTION_METHOD_OPTIONS) productionMethod.append(el('option', label, {value, selected: card.draft.production_method === value}));
+  productionMethod.addEventListener('change', () => { card.draft.production_method = productionMethod.value; markDirty(card, node); });
+  productionFields.append(inputLabel('Made to order?', madeToOrder), inputLabel('Production method', productionMethod));
+  production.append(
+    productionFields,
+    el('p', 'For made-to-order products, choose the actual production method. The pictured product is a representative sample; Listing Copilot must not describe it as stocked inventory, and exact placement or color may vary.', {class: 'help'}),
+  );
   const measurements = el('div', null, {class: 'field-grid'});
   measurements.append(dimensionControl(card, node, 'width', 'width_eighths', 'Width'), dimensionControl(card, node, 'height', 'height_eighths', 'Height'));
   const copilot = renderListingCopilot(card, node);
@@ -905,7 +1230,7 @@ function renderCard(card) {
   const archive = el('button', card.state === 'draft' ? 'Archive Draft' : 'Remove from Store', {type: 'button', class: 'danger', hidden: card.state === 'archived'}); archive.addEventListener('click', () => void archiveCard(card));
   const restore = el('button', 'Restore Draft', {type: 'button', class: 'secondary', hidden: card.state !== 'archived'}); restore.addEventListener('click', () => void restoreCard(card));
   actions.append(save, preview, publish, archive, restore);
-  node.append(heading, identity, description, commerce, measurements, copilot, storeOrder, photos, configurations, errors, actions);
+  node.append(heading, identity, description, commerce, production, measurements, copilot, storeOrder, photos, configurations, errors, actions);
   renderErrors(card, node);
   return node;
 }
@@ -997,13 +1322,29 @@ async function saveCards(cards) {
       if (!result || result.success === false || result.ok === false) { showResultErrors(card, result || {error: 'No result was returned for this card.'}); continue; }
       if (result.artwork) {
         const updated = normalizeCard(result.artwork);
+        clearCopilotRequestIds(card);
         Object.assign(card, updated, {clientId: card.clientId || updated.clientId});
       } else {
+        clearCopilotRequestIds(card);
         card.id = result.id || result.artwork_id || card.id;
         card.stableId = result.stable_id || card.stableId;
         card.version = result.version ?? result.revision_version ?? card.version + 1;
         card.state = result.state || card.state;
-        card.copilot = {assessment: null, suggestion: null, priceGuidance: null, priceFloor: '', message: '', busy: false, reviewNote: ''};
+        card.copilot = {
+          assessment: null,
+          suggestion: null,
+          priceGuidance: null,
+          priceFloor: '',
+          requestIds: {copy: null, compliance: null},
+          message: '',
+          busy: false,
+          reviewNote: '',
+          escalationStage: 'seller_clarification',
+          escalationOutcome: 'requested',
+          escalationReviewerRole: '',
+          escalationNote: '',
+          escalations: [],
+        };
       }
       const savedDraft = serializeCard(card);
       savedDraft.configurations = savedDraft.configurations.map(normalizeConfiguration);

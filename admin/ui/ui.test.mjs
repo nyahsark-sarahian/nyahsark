@@ -76,7 +76,7 @@ test('Listing Copilot collects disclosures and keeps AI wording suggestion-only'
   assert.match(javascript, /Bounded visual observations \(not authentication\)/);
   assert.match(javascript, /reviewNote\.trim\(\)\.length < 8/);
   assert.match(javascript, /Listing Copilot is temporarily unavailable/);
-  const applyFunction = /function applyCopilotSuggestion[\s\S]*?\n}\n\nfunction copilotUnavailableMessage/.exec(javascript)?.[0] || '';
+  const applyFunction = /function applyCopilotSuggestion[\s\S]*?\r?\n}\r?\n\r?\nfunction copilotUnavailableMessage/.exec(javascript)?.[0] || '';
   assert.ok(applyFunction);
   assert.doesNotMatch(applyFunction, /sendJSON|saveCards|publishCard/);
   assert.match(javascript, /Guidance uses verified store sales and server-owned activity only/i);
@@ -108,7 +108,7 @@ test('Listing Copilot collects disclosures and keeps AI wording suggestion-only'
   assert.match(javascript, /Retry the same canonical review/);
   assert.match(javascript, /Start a new wording action/);
   assert.match(javascript, /Start a new review action/);
-  const applyPriceFunction = /function applyPriceGuidance[\s\S]*?\n}\n\nasync function submitHumanReview/.exec(javascript)?.[0] || '';
+  const applyPriceFunction = /function applyPriceGuidance[\s\S]*?\r?\n}\r?\n\r?\nasync function submitHumanReview/.exec(javascript)?.[0] || '';
   assert.ok(applyPriceFunction);
   assert.match(applyPriceFunction, /card\._raw\.price = formatPriceInput\(cents\)/);
   assert.match(applyPriceFunction, /markDirty\(card\)/);

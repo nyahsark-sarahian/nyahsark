@@ -613,6 +613,51 @@ test('verified payment webhooks commit once, deduplicate events, and support pro
   assert.equal((await getOrder(state.DB, checkout.order_id)).tracking, 'TRACK-0001');
 });
 
+test('a verified partial refund is durably recorded for manual review without rewriting a completed payment', async () => {
+  const state = await fixture();
+  const {environment} = providerEnvironment();
+  const checkout = await checkedOut(state, environment);
+  environment.PAYMENT_PROVIDER.event = paymentEvent(checkout);
+  await handlePaymentWebhook(state.DB, webhookRequest('paid-before-partial-refund'), environment);
+
+  environment.PAYMENT_PROVIDER.event = paymentEvent(checkout, {
+    event_id: 'event-partial-refund-0001',
+    event_type: 'charge.refunded',
+    status: 'partial_refund',
+    refunded_amount_cents: 1000
+  });
+  const result = await handlePaymentWebhook(state.DB, webhookRequest('partial-refund'), environment);
+
+  assert.deepEqual(result, {accepted: true, duplicate: false, manual_review: true});
+  assert.equal(state.sqlite.prepare('SELECT payment_status FROM catalog_orders').get().payment_status, 'paid');
+  assert.equal(state.sqlite.prepare('SELECT status FROM catalog_payment_attempts').get().status, 'complete');
+  assert.equal(state.sqlite.prepare('SELECT count(*) AS n FROM catalog_payment_events').get().n, 2);
+  const audit = state.sqlite.prepare("SELECT details_json FROM catalog_audit_events WHERE action='partial_refund_manual_review'").get();
+  assert.equal(JSON.parse(audit.details_json).refunded_amount_cents, 1000);
+});
+
+test('a partial refund received before settlement makes the order uncertain and preserves inventory', async () => {
+  const state = await fixture();
+  const {environment} = providerEnvironment();
+  const checkout = await checkedOut(state, environment);
+  environment.PAYMENT_PROVIDER.event = paymentEvent(checkout, {
+    event_id: 'event-early-partial-refund-0001',
+    event_type: 'charge.refunded',
+    status: 'partial_refund',
+    refunded_amount_cents: 1000
+  });
+  const result = await handlePaymentWebhook(state.DB, webhookRequest('early-partial-refund'), environment);
+
+  assert.equal(result.manual_review, true);
+  assert.equal(state.sqlite.prepare('SELECT payment_status FROM catalog_orders').get().payment_status, 'session_uncertain');
+  assert.equal(state.sqlite.prepare('SELECT status FROM catalog_payment_attempts').get().status, 'uncertain');
+  assert.equal(state.sqlite.prepare('SELECT state FROM catalog_inventory_reservations').get().state, 'active');
+  assert.deepEqual(
+    {...state.sqlite.prepare('SELECT physical_stock,reserved_stock FROM catalog_inventory').get()},
+    {physical_stock: 1, reserved_stock: 1}
+  );
+});
+
 test('concurrent paid and failed webhooks cannot diverge payment state from inventory', async () => {
   async function scenario(executionOrder) {
     const state=await fixture();

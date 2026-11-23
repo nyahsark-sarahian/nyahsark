@@ -3,9 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test public-worker/test/*.test.mjs admin/test/*.test.mjs admin/ui/*.test.mjs",
+    "test": "node --test public-worker/test/*.test.mjs admin/test/*.test.mjs admin/ui/*.test.mjs payment-provider/stripe/test/*.test.mjs payment-provider/shipping-sandbox/test/*.test.mjs payment-provider/tax-sandbox/test/*.test.mjs",
     "test:storefront": "node --test public-worker/test/*.test.mjs",
     "test:admin": "node --test admin/test/*.test.mjs admin/ui/*.test.mjs",
+    "test:payments": "node --test payment-provider/stripe/test/*.test.mjs payment-provider/shipping-sandbox/test/*.test.mjs payment-provider/tax-sandbox/test/*.test.mjs",
+    "test:shipping": "node --test payment-provider/shipping-sandbox/test/*.test.mjs",
+    "test:tax": "node --test payment-provider/tax-sandbox/test/*.test.mjs",
     "deploy:dry": "wrangler deploy --dry-run"
   },
   "devDependencies": {

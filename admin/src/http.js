@@ -6,10 +6,13 @@ export class HttpError extends Error {
   }
 }
 
+export const STRICT_TRANSPORT_SECURITY = 'max-age=31536000; includeSubDomains';
+
 export const noStoreHeaders = {
   'Cache-Control': 'private, no-store, no-transform',
   'X-Content-Type-Options': 'nosniff',
-  'Referrer-Policy': 'no-referrer'
+  'Referrer-Policy': 'no-referrer',
+  'Strict-Transport-Security': STRICT_TRANSPORT_SECURITY
 };
 
 export function json(value, status = 200, headers = {}) {
@@ -19,7 +22,12 @@ export function json(value, status = 200, headers = {}) {
 export function publicJson(value, status = 200, headers = {}) {
   return Response.json(value, {
     status,
-    headers: {'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...headers}
+    headers: {
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Strict-Transport-Security': STRICT_TRANSPORT_SECURITY,
+      ...headers
+    }
   });
 }
 

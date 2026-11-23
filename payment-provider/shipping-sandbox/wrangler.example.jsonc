@@ -1,0 +1,12 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "nyahsark-shipping-sandbox",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-22",
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "SHIPPING_MODE": "sandbox",
+    "SANDBOX_SERVICE_RATES_JSON": "{\"TEST_GROUND\":{\"base_cents\":300,\"per_parcel_cents\":200,\"per_item_cents\":50}}"
+  }
+}

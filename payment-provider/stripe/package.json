@@ -1,0 +1,13 @@
+{
+  "name": "nyahsark-stripe-sandbox-provider",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/index.js",
+    "test": "node --test test/*.test.mjs",
+    "deploy:dry": "wrangler deploy --dry-run --config wrangler.example.jsonc"
+  },
+  "devDependencies": {
+    "wrangler": "4.165.0"
+  }
+}

@@ -941,6 +941,9 @@ async function verifiedWebhook(request, env) {
     if (typeof event[field] !== 'string' || !event[field]) throw new HttpError(400, 'Payment event is invalid');
   }
   if (!integer(event.amount_cents, 0, MAX_MONEY)) throw new HttpError(400, 'Payment event amount is invalid');
+  if (event.status === 'partial_refund' && !integer(event.refunded_amount_cents, 1, event.amount_cents - 1)) {
+    throw new HttpError(400, 'Partial refund amount is invalid');
+  }
   event.payload_hash = await hashBytes(raw);
   return event;
 }
@@ -970,14 +973,18 @@ async function recordPaymentStateRaceManualReview(database, event, order, contex
   const orderUpdate = event.status === 'refunded'
     ? database.prepare("UPDATE catalog_orders SET payment_status='refunded',updated_at=unixepoch() WHERE id=? AND payment_status='paid'").bind(order.id)
     : database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=? AND payment_status IN ('pending','session_uncertain','authorized','failed','expired')").bind(order.id);
+  const auditAction = event.status === 'partial_refund' ? 'partial_refund_manual_review' : 'payment_state_race_manual_review';
   const statements = [
     database.prepare(
       'INSERT INTO catalog_payment_events(provider,provider_event_id,order_id,event_type,verified,payload_hash,occurred_at) VALUES(?,?,?,?,1,?,?)'
     ).bind(event.provider, event.event_id, order.id, event.event_type, event.payload_hash, occurredAt),
     orderUpdate,
     database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id),
-    database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','payment_state_race_manual_review',?)")
-      .bind(JSON.stringify({order_id: order.id, event_id: event.event_id, status: event.status, atomic_guard: true}))
+    database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider',?,?)")
+      .bind(auditAction, JSON.stringify({
+        order_id: order.id, event_id: event.event_id, status: event.status,
+        refunded_amount_cents: event.refunded_amount_cents || null, atomic_guard: true
+      }))
   ];
   try {
     await database.batch(statements);
@@ -1073,6 +1080,17 @@ export async function handlePaymentWebhook(database, request, env = {}, context 
       statements.push(database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','early_refund_manual_review',?)")
         .bind(JSON.stringify({order_id:order.id,event_id:event.event_id,prior_status:order.payment_status})));
     }
+  } else if (event.status === 'partial_refund') {
+    manualReview = true;
+    if (['pending','session_uncertain','authorized','failed','expired'].includes(order.payment_status)) {
+      statements.push(database.prepare("UPDATE catalog_orders SET payment_status='session_uncertain',updated_at=unixepoch() WHERE id=?").bind(order.id));
+      statements.push(database.prepare("UPDATE catalog_payment_attempts SET status='uncertain',updated_at=unixepoch() WHERE order_id=? AND status<>'complete'").bind(order.id));
+    }
+    statements.push(database.prepare("INSERT INTO catalog_audit_events(artwork_id,actor,action,details_json) VALUES(NULL,'payment-provider','partial_refund_manual_review',?)")
+      .bind(JSON.stringify({
+        order_id:order.id,event_id:event.event_id,prior_status:order.payment_status,
+        refunded_amount_cents:event.refunded_amount_cents
+      })));
   } else {
     throw new HttpError(400, 'Payment event status is unsupported');
   }

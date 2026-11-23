@@ -1,0 +1,16 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "nyahsark-tax-sandbox",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-22",
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "STRIPE_TAX_MODE": "sandbox",
+    "STRIPE_TAX_API_VERSION": "2026-11-18.endive",
+    "STRIPE_TAX_REGISTRATION_REFERENCE": "replace-with-reviewed-internal-registration-reference",
+    "STRIPE_TAX_MERCHANDISE_TAX_CODE": "replace-with-reviewed-stripe-tax-code",
+    "STRIPE_TAX_SHIPPING_TAX_CODE": "replace-with-reviewed-stripe-tax-code",
+    "STRIPE_TAX_HANDLING_TAX_CODE": "replace-with-reviewed-stripe-tax-code"
+  }
+}

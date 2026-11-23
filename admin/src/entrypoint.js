@@ -53,7 +53,16 @@ import {
   saveAiSuggestion,
   saveHumanReview
 } from './compliance.js';
-import {HttpError, json, noStoreHeaders, publicJson, readJson, requireOrigin, routeError} from './http.js';
+import {
+  HttpError,
+  STRICT_TRANSPORT_SECURITY,
+  json,
+  noStoreHeaders,
+  publicJson,
+  readJson,
+  requireOrigin,
+  routeError
+} from './http.js';
 import {assertPublicationAllowed, calibrationMode, verifyCalibrationPublicationGuards} from './calibration.js';
 
 const ADMIN_ASSETS = new Set([
@@ -164,6 +173,7 @@ function mediaResponse(media, {isPublic = false} = {}) {
     'X-Content-Type-Options': 'nosniff',
     'Content-Security-Policy': "default-src 'none'; sandbox",
     'Cross-Origin-Resource-Policy': 'same-origin',
+    'Strict-Transport-Security': STRICT_TRANSPORT_SECURITY,
     'Cache-Control': isPublic ? 'public, max-age=300, must-revalidate' : 'private, no-store, no-transform'
   };
   return new Response(media.body, {headers});

@@ -33,6 +33,7 @@ test('catalog list forwards only safe headers and query', async () => {
   assert.equal(observed.headers.get('x-private'), null);
   assert.equal(response.headers.get('set-cookie'), null);
   assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.headers.get('strict-transport-security'), 'max-age=31536000; includeSubDomains');
 });
 
 test('detail and display media are allowed; original and admin media are denied', async () => {
@@ -75,6 +76,8 @@ test('unsafe methods, invalid bodies, and absent binding fail closed', async () 
 
 test('worker serves assets outside the narrow API surface', async () => {
   const env = environment(async () => Response.json({}));
-  assert.equal(await (await worker.fetch(request('/site.css'), env)).text(), 'asset');
+  const response = await worker.fetch(request('/site.css'), env);
+  assert.equal(await response.text(), 'asset');
+  assert.equal(response.headers.get('strict-transport-security'), 'max-age=31536000; includeSubDomains');
   assert.equal((await worker.fetch(new Request('https://other.example/site.css'), env)).status, 404);
 });

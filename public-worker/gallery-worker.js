@@ -1,12 +1,14 @@
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_PUBLIC_BODY = 64 * 1024;
+const STRICT_TRANSPORT_SECURITY = 'max-age=31536000; includeSubDomains';
 
 const json = (value, status = 200) => new Response(JSON.stringify(value), {
   status,
   headers: {
     'Content-Type': JSON_TYPE,
     'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff'
+    'X-Content-Type-Options': 'nosniff',
+    'Strict-Transport-Security': STRICT_TRANSPORT_SECURITY
   }
 });
 
@@ -58,7 +60,8 @@ function responseHeaders(upstream, route) {
   const headers = new Headers({
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer'
+    'Referrer-Policy': 'no-referrer',
+    'Strict-Transport-Security': STRICT_TRANSPORT_SECURITY
   });
   const type = upstream.headers.get('content-type');
   if (type) headers.set('Content-Type', type);
@@ -66,6 +69,16 @@ function responseHeaders(upstream, route) {
     headers.set('Content-Security-Policy', "default-src 'none'; sandbox");
   }
   return headers;
+}
+
+function hardenedAssetResponse(response) {
+  const headers = new Headers(response.headers);
+  headers.set('Strict-Transport-Security', STRICT_TRANSPORT_SECURITY);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
 }
 
 export async function proxyPublicRequest(request, env) {
@@ -120,7 +133,7 @@ export default {
       if (!env.ASSETS?.fetch || !['GET', 'HEAD'].includes(request.method)) {
         return json({ error: 'Not found' }, 404);
       }
-      return env.ASSETS.fetch(request);
+      return hardenedAssetResponse(await env.ASSETS.fetch(request));
     } catch {
       return json({ error: 'Request could not be completed' }, 500);
     }

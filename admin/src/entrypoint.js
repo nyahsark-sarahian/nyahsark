@@ -1,6 +1,7 @@
 import revisionedSchema from '../migrations/0003_revisioned_catalog.sql';
 import commandSchema from '../migrations/0004_settings_commands.sql';
 import complianceSchema from '../migrations/0005_listing_compliance.sql';
+import governanceSchema from '../migrations/0006_ai_governance.sql';
 import {makeVerifier} from './verifier.js';
 import {ensureSchema} from './schema.js';
 import {
@@ -33,10 +34,19 @@ import {
 } from './commerce.js';
 import {sanitizeImage, MEDIA_LIMITS} from './media.js';
 import {aiAssistCapabilities, generateListingAssistance} from './ai-assist.js';
+import {reserveComplianceAssistance} from './ai-compliance-workflow.js';
+import {deterministicPolicyPreflight, dispatchDraftCopyIfAllowed} from './ai-policy-gate.js';
+import {
+  AiBudgetError,
+  failAiInferenceBudget,
+  getAiBudgetStatus,
+  reconcileAiInferenceBudget,
+  reserveAiInferenceBudget
+} from './ai-budget.js';
 import {getListingPriceGuidance} from './pricing-service.js';
+import {savePricingPreference, saveReviewEscalation} from './listing-governance.js';
 import {
   POLICY_VERSION,
-  createPendingAssessment,
   getActiveAssessment,
   runDeterministicAssessment,
   saveAssessment,
@@ -44,6 +54,7 @@ import {
   saveHumanReview
 } from './compliance.js';
 import {HttpError, json, noStoreHeaders, publicJson, readJson, requireOrigin, routeError} from './http.js';
+import {assertPublicationAllowed, calibrationMode, verifyCalibrationPublicationGuards} from './calibration.js';
 
 const ADMIN_ASSETS = new Set([
   '/admin.html',
@@ -53,6 +64,7 @@ const ADMIN_ASSETS = new Set([
   '/common.js',
   '/session.js',
   '/supabase.js',
+  '/nyahs-ark-logo.svg',
   '/auth/password-signin.js',
   '/auth/request-recovery.js',
   '/auth/recovery.js'
@@ -76,8 +88,9 @@ async function ready(env) {
   if (!env.DB) throw Error('Database binding is unavailable');
   if (!initialized) {
     initialized = (async () => {
-      await ensureSchema(env.DB, revisionedSchema, commandSchema, complianceSchema);
-      await reconcileBaseline(env.DB);
+      await ensureSchema(env.DB, revisionedSchema, commandSchema, complianceSchema, governanceSchema);
+      if (calibrationMode(env)) await verifyCalibrationPublicationGuards(env.DB);
+      else await reconcileBaseline(env.DB);
     })().catch((error) => {
       initialized = undefined;
       throw error;
@@ -214,6 +227,20 @@ function requireCurrentVersion(body, artwork) {
   if (artwork.state === 'archived') throw new HttpError(409, 'Restore this artwork before using Listing Copilot', {code: 'ARTWORK_ARCHIVED'});
 }
 
+function aiActionIdentifier(body, purpose) {
+  const supplied = body?.request_id;
+  if (typeof supplied !== 'string' || supplied.length < 8 || supplied.length > 100 || !OPAQUE_ID.test(supplied)) {
+    throw new HttpError(400, 'AI request identifier is required');
+  }
+  return `copilot:${purpose}:${supplied}`;
+}
+
+function budgetHttpError(error) {
+  return error instanceof AiBudgetError
+    ? new HttpError(error.status, error.message, {code: error.code})
+    : error;
+}
+
 async function sanitizedAssistanceImage(env, photo) {
   const media = await getManagedMedia(env.DB, photo.asset_id, 'display');
   if (media.body && media.content_type === 'image/webp') {
@@ -250,16 +277,73 @@ async function assertSupportedActivePolicy(database) {
   }
 }
 
-async function generateAndSaveAssistance(env, artwork, actor, {allPhotos = false} = {}) {
+async function prepareAssistance(env, artwork, actor, {allPhotos = false, actionId} = {}) {
   if (!aiAssistCapabilities(env).enabled) {
     throw new HttpError(503, 'AI listing assistance is not configured', {code: 'AI_ASSIST_UNAVAILABLE'});
   }
   const images = await assistanceImages(env, artwork, allPhotos);
-  const results = await Promise.all(images.map((image) => generateListingAssistance(env, {
-    image,
-    draft: artwork.draft,
-    disclosures: artwork.draft.compliance
-  })));
+  let reservation;
+  try {
+    reservation = await reserveAiInferenceBudget(env.DB, {
+      actionId: actionId || `copilot:internal:${crypto.randomUUID()}`,
+      imageCount: images.length,
+      modelId: env.AI_ASSIST_MODEL,
+      actor
+    }, {env});
+  } catch (error) {
+    throw budgetHttpError(error);
+  }
+  // A replayed identifier may represent an in-flight or already billed call.
+  // Never dispatch it again without a fresh user action identifier.
+  if (reservation.reused) {
+    throw new HttpError(409, 'This Listing Copilot action was already submitted; start a new action to try again', {code: 'AI_ACTION_REPLAY'});
+  }
+  return {images, reservation};
+}
+
+async function prepareComplianceAssistance(env, artwork, actor, {allPhotos = false, actionId} = {}) {
+  if (!aiAssistCapabilities(env).enabled) {
+    throw new HttpError(503, 'AI listing assistance is not configured', {code: 'AI_ASSIST_UNAVAILABLE'});
+  }
+  const images = await assistanceImages(env, artwork, allPhotos);
+  const reservation = await reserveComplianceAssistance(env, artwork, actor, {
+    imageCount: images.length,
+    actionId
+  });
+  return {images, reservation};
+}
+
+async function generateAndSaveAssistance(env, artwork, actor, {allPhotos = false, actionId, prepared} = {}) {
+  const work = prepared || await prepareAssistance(env, artwork, actor, {allPhotos, actionId});
+  const {images, reservation} = work;
+  let results;
+  try {
+    results = await Promise.all(images.map((image) => generateListingAssistance(env, {
+      image,
+      draft: artwork.draft,
+      disclosures: artwork.draft.compliance
+    })));
+  } catch (error) {
+    try {
+      await failAiInferenceBudget(env.DB, {
+        reservationId: reservation.reservation_id,
+        errorCode: error?.details?.code || 'workers_ai_failed'
+      });
+    } catch (reconciliationError) {
+      throw budgetHttpError(reconciliationError);
+    }
+    throw error;
+  }
+  try {
+    await reconcileAiInferenceBudget(env.DB, {
+      reservationId: reservation.reservation_id,
+      state: 'completed',
+      actualCostMicrousd: reservation.estimated_cost_microusd,
+      usage: {billing_basis: 'conservative_pre_dispatch_estimate', image_count: images.length}
+    });
+  } catch (error) {
+    throw budgetHttpError(error);
+  }
   await assertUnchangedArtwork(env, artwork);
   const primary = results[0];
   const suggestions = {
@@ -357,10 +441,13 @@ async function adminApi(request, env, url) {
   const actor = `admin:${identity.subject}`;
 
   if (request.method === 'GET' && url.pathname === '/api/admin/capabilities') {
+    let budget;
+    try { budget = await getAiBudgetStatus(env.DB, env); }
+    catch (error) { throw budgetHttpError(error); }
     return json({
       media: mediaCapabilities(env.IMAGE_TRANSFORM_QUALIFIED),
-      ai: aiAssistCapabilities(env),
-      compliance: {policy_version: POLICY_VERSION, deterministic_enforcement: true, human_review: true}
+      ai: {...aiAssistCapabilities(env), budget},
+      compliance: {policy_version: POLICY_VERSION, deterministic_enforcement: true, human_review: true, priest_escalation: true}
     });
   }
   if (request.method === 'POST' && url.pathname === '/api/admin/capabilities/probe') {
@@ -386,7 +473,10 @@ async function adminApi(request, env, url) {
     const body = await readJson(request, 32 * 1024);
     const artwork = await getAdminArtwork(env.DB, assistDraft);
     requireCurrentVersion(body, artwork);
-    const {assistance} = await generateAndSaveAssistance(env, artwork, actor, {allPhotos: true});
+    const {assistance} = await dispatchDraftCopyIfAllowed(artwork.draft, () => generateAndSaveAssistance(env, artwork, actor, {
+      allPhotos: true,
+      actionId: aiActionIdentifier(body, 'draft-copy')
+    }));
     return json({
       suggestion: {
         ...assistance.suggestions,
@@ -404,13 +494,16 @@ async function adminApi(request, env, url) {
     const body = await readJson(request, 32 * 1024);
     const artwork = await getAdminArtwork(env.DB, assistPrice);
     requireCurrentVersion(body, artwork);
+    const pricingPreference = await savePricingPreference(env.DB, {
+      artwork_id: artwork.id,
+      seller_floor_cents: body.seller_floor_cents
+    }, actor);
     const guidance = await getListingPriceGuidance(env.DB, {
       artwork_id: artwork.id,
-      revision_id: artwork.working_revision_id,
-      seller_floor_cents: body.seller_floor_cents
+      revision_id: artwork.working_revision_id
     });
     await assertUnchangedArtwork(env, artwork);
-    return json({...guidance, message: 'Advisory price guidance is ready. No price was changed or published.'});
+    return json({...guidance, pricing_preference: pricingPreference, message: 'Advisory price guidance is ready. The seller floor was saved. No price was changed or published.'});
   }
   const assessCompliance = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)\/compliance\/assess$/);
   if (request.method === 'POST' && assessCompliance) {
@@ -418,20 +511,42 @@ async function adminApi(request, env, url) {
     const artwork = await getAdminArtwork(env.DB, assessCompliance);
     requireCurrentVersion(body, artwork);
     await assertSupportedActivePolicy(env.DB);
+    const preflight = deterministicPolicyPreflight(artwork.draft);
+    if (preflight.decision === 'block') {
+      const assessment = await runDeterministicAssessment(env.DB, {
+        artwork_id: artwork.id,
+        revision_id: artwork.working_revision_id,
+        offered_for_sale: artwork.draft.offered_for_sale,
+        disclosures: artwork.draft.compliance,
+        observations: [],
+        source: 'deterministic'
+      }, actor);
+      await assertSupportedActivePolicy(env.DB);
+      await assertUnchangedArtwork(env, artwork);
+      return json({
+        assessment,
+        suggestion: null,
+        ai_observations_used: 0,
+        message: 'Canonical listing review recorded a deterministic sale block from the saved listing facts. Workers AI was not invoked.'
+      });
+    }
     const capabilities = aiAssistCapabilities(env);
     let observations = [];
     let suggestion = null;
     let model = null;
     let promptVersion = null;
     if (artwork.draft.offered_for_sale && capabilities.enabled) {
-      await createPendingAssessment(env.DB, {
-        artwork_id: artwork.id,
-        revision_id: artwork.working_revision_id,
-        policy_version: POLICY_VERSION,
-        source: 'ai_assisted'
-      }, actor);
+      let aiAttemptStarted = false;
       try {
-        const {assistance} = await generateAndSaveAssistance(env, artwork, actor, {allPhotos: true});
+        const prepared = await prepareComplianceAssistance(env, artwork, actor, {
+          allPhotos: true,
+          actionId: aiActionIdentifier(body, 'compliance')
+        });
+        aiAttemptStarted = true;
+        const {assistance} = await generateAndSaveAssistance(env, artwork, actor, {
+          allPhotos: true,
+          prepared
+        });
         observations = assistance.observations;
         suggestion = {
           ...assistance.suggestions,
@@ -441,7 +556,7 @@ async function adminApi(request, env, url) {
         model = assistance.model;
         promptVersion = assistance.prompt_version;
       } catch (error) {
-        if (error?.details?.code !== 'HEAD_CONFLICT') {
+        if (aiAttemptStarted && error?.details?.code !== 'HEAD_CONFLICT') {
           await saveAssessment(env.DB, {
             artwork_id: artwork.id,
             revision_id: artwork.working_revision_id,
@@ -500,13 +615,36 @@ async function adminApi(request, env, url) {
     await assertUnchangedArtwork(env, artwork);
     return json({assessment, message: 'Human review decision recorded in the immutable audit history.'});
   }
+  const escalateCompliance = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)\/compliance\/escalate$/);
+  if (request.method === 'POST' && escalateCompliance) {
+    const body = await readJson(request, 32 * 1024);
+    const artwork = await getAdminArtwork(env.DB, escalateCompliance);
+    requireCurrentVersion(body, artwork);
+    await assertSupportedActivePolicy(env.DB);
+    const current = await getActiveAssessment(env.DB, artwork.working_revision_id);
+    if (!current) throw new HttpError(409, 'Run canonical listing review before recording a consultation', {code: 'ASSESSMENT_REQUIRED'});
+    await assertUnchangedArtwork(env, artwork);
+    const result = await saveReviewEscalation(env.DB, {
+      assessment_id: current.id,
+      stage: body.stage,
+      outcome: body.outcome,
+      reviewer_role: body.reviewer_role,
+      note: body.note
+    }, actor);
+    await assertSupportedActivePolicy(env.DB);
+    await assertUnchangedArtwork(env, artwork);
+    return json({...result, message: 'Human consultation recorded in the immutable compliance history.'});
+  }
   const preview = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)\/preview$/);
   if (request.method === 'POST' && preview) {
     const body = await readJson(request);
     return json(await previewDraft(env.DB, preview, body.draft));
   }
   const publish = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)\/publish$/);
-  if (request.method === 'POST' && publish) return json({artwork: await publishArtwork(env.DB, publish, await readJson(request), actor), message: 'Artwork published.'});
+  if (request.method === 'POST' && publish) {
+    assertPublicationAllowed(env);
+    return json({artwork: await publishArtwork(env.DB, publish, await readJson(request), actor), message: 'Artwork published.'});
+  }
   const archive = pathIdentifier(url.pathname, /^\/api\/admin\/artworks\/([^/]+)\/archive$/);
   if (request.method === 'POST' && archive) {
     const body = await readJson(request);

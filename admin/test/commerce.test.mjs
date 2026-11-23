@@ -12,7 +12,8 @@ const migrationNames = [
   '0002_private_image_objects.sql',
   '0003_revisioned_catalog.sql',
   '0004_settings_commands.sql',
-  '0005_listing_compliance.sql'
+  '0005_listing_compliance.sql',
+  '0006_ai_governance.sql'
 ];
 const migrations = migrationNames.map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
 

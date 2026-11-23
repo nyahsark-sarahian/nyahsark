@@ -31,27 +31,52 @@ test('initial price advice requires verified recent sold comparables and never c
   assert.equal(result.seller_confirmation_required, true);
 });
 
-test('markdown advice respects compliance, evidence, cooldowns, engagement and seller floor', () => {
+test('markdown advice uses the approved age schedule, original price, cooldown, and seller floor', () => {
   const base = {
-    compliance_decision: 'allow', current_price_cents: 20_000, seller_floor_cents: 15_000,
+    compliance_decision: 'allow', original_price_cents: 20_000, current_price_cents: 20_000, seller_floor_cents: 15_000,
     listing_age_days: 95, days_since_price_change: 30, qualified_views: 100,
     recent_carts: 0, recent_inquiries: 0, recent_checkout_starts: 0
   };
   assert.equal(suggestMarkdown({...base, compliance_decision: 'review'}).status, 'no_recommendation');
-  assert.equal(suggestMarkdown({...base, qualified_views: 4}).status, 'no_recommendation');
+  assert.equal(suggestMarkdown({...base, qualified_views: 0}).status, 'suggested');
   assert.equal(suggestMarkdown({...base, recent_checkout_starts: 1}).status, 'no_recommendation');
+  assert.equal(suggestMarkdown({...base, listing_age_days: 44}).status, 'no_recommendation');
+  assert.equal(suggestMarkdown({...base, days_since_price_change: 29}).status, 'no_recommendation');
+  assert.equal(suggestMarkdown({...base, seller_floor_cents: 0}).status, 'no_recommendation');
 
   const result = suggestMarkdown(base);
   assert.equal(result.status, 'suggested');
-  assert.equal(result.suggested_markdown_percent, 12);
-  assert.equal(result.proposed_price_cents, 17_600);
+  assert.equal(result.target_markdown_percent, 10);
+  assert.equal(result.suggested_markdown_percent, 10);
+  assert.equal(result.proposed_price_cents, 18_000);
   assert.equal(result.automatic_price_change, false);
 
-  const engaged = suggestMarkdown({...base, recent_carts: 1, recent_inquiries: 1});
-  assert.equal(engaged.suggested_markdown_percent, 7);
+  const day45 = suggestMarkdown({...base, listing_age_days: 45});
+  assert.equal(day45.target_markdown_percent, 5);
+  assert.equal(day45.proposed_price_cents, 19_000);
+  const day90 = suggestMarkdown({...base, listing_age_days: 90});
+  assert.equal(day90.target_markdown_percent, 10);
+  const day135 = suggestMarkdown({...base, listing_age_days: 135});
+  assert.equal(day135.target_markdown_percent, 15);
+  assert.equal(day135.proposed_price_cents, 17_000);
+
   const floored = suggestMarkdown({...base, seller_floor_cents: 19_500});
+  assert.equal(floored.target_markdown_percent, 10);
   assert.equal(floored.suggested_markdown_percent, 2);
   assert.equal(floored.proposed_price_cents, 19_600);
+});
+
+test('markdown schedule never compounds past the original-price target', () => {
+  const base = {
+    compliance_decision: 'allow', original_price_cents: 20_000, current_price_cents: 19_000, seller_floor_cents: 12_000,
+    listing_age_days: 90, days_since_price_change: 30, qualified_views: 100,
+    recent_carts: 0, recent_inquiries: 0, recent_checkout_starts: 0
+  };
+  const result = suggestMarkdown(base);
+  assert.equal(result.status, 'suggested');
+  assert.equal(result.proposed_price_cents, 18_000);
+  assert.equal(result.target_markdown_percent, 10);
+  assert.equal(suggestMarkdown({...base, current_price_cents: 18_000}).status, 'no_recommendation');
 });
 
 test('pricing inputs fail closed when money or metrics are malformed', () => {

@@ -97,6 +97,28 @@ const complianceObjects = {
   ],
   view: ['catalog_compliance_effective']
 };
+const governanceObjects = {
+  table: [
+    'catalog_ai_budget_months','catalog_ai_inference_ledger','catalog_listing_price_floors',
+    'catalog_review_escalations'
+  ],
+  trigger: [
+    'catalog_ai_reservation_state_guard','catalog_ai_reservation_month_guard','catalog_ai_reservation_action_guard',
+    'catalog_ai_reservation_image_cap_guard','catalog_ai_reservation_budget_guard','catalog_ai_reservation_apply',
+    'catalog_ai_reconcile_guard','catalog_ai_reconcile_apply','catalog_ai_inference_delete_guard',
+    'catalog_listing_price_floor_immutable_update','catalog_listing_price_floor_immutable_delete',
+    'catalog_review_escalation_owner','catalog_review_escalation_active_policy_guard',
+    'catalog_review_escalation_latest_guard','catalog_review_escalation_unresolved_guard',
+    'catalog_review_escalation_seller_clearance_guard',
+    'catalog_review_escalation_terminal_guard','catalog_review_escalation_sequence_guard',
+    'catalog_review_escalation_immutable_update','catalog_review_escalation_immutable_delete',
+    'catalog_review_consultation_guard'
+  ],
+  index: [
+    'catalog_ai_inference_month','catalog_ai_inference_state','catalog_listing_price_floor_lookup',
+    'catalog_review_escalation_assessment'
+  ]
+};
 
 async function applyIfMissing(database, objects, sql) {
   if (await schemaReady(database, objects)) return;
@@ -112,14 +134,15 @@ async function applyIfMissing(database, objects, sql) {
   if (!(await schemaReady(database, objects))) throw Error('Catalog migration did not complete');
 }
 
-export function ensureSchema(database, revisionedSchema, commandSchema = '', complianceSchema = '') {
-  const requestedLevel = complianceSchema.trim() ? 3 : commandSchema.trim() ? 2 : 1;
+export function ensureSchema(database, revisionedSchema, commandSchema = '', complianceSchema = '', governanceSchema = '') {
+  const requestedLevel = governanceSchema.trim() ? 4 : complianceSchema.trim() ? 3 : commandSchema.trim() ? 2 : 1;
   if (!readiness || readinessLevel < requestedLevel) {
     readinessLevel = requestedLevel;
     readiness = (async () => {
       await applyIfMissing(database, coreObjects, revisionedSchema);
       await applyIfMissing(database, commandObjects, commandSchema);
       if (complianceSchema.trim()) await applyIfMissing(database, complianceObjects, complianceSchema);
+      if (governanceSchema.trim()) await applyIfMissing(database, governanceObjects, governanceSchema);
     })().catch((error) => {
       readiness = undefined;
       readinessLevel = 0;

@@ -1,4 +1,5 @@
 import {HttpError, assertText} from './http.js';
+import {listReviewEscalations} from './listing-governance.js';
 
 export const POLICY_VERSION = 'canonical-listing-v1';
 
@@ -139,7 +140,11 @@ function savedCopyFlags(listingCopy) {
   const relicMatter = String.raw`(?:body|skull|ashes|fingers?|skin|organs?|bones?|blood|teeth|tooth|tissue|hair|nails?|clothing|garments?|cloth|veil|fragments?|particles?|remains?)`;
   const currencyAmount = String.raw`(?:[$€£¥₹]\s*\d[\d,.]*|\d[\d,.]*\s*(?:usd|cad|aud|eur|gbp|jpy|cny|dollars?|euros?|pounds?|yen|rupees?)\b|(?:usd|cad|aud|eur|gbp|jpy|cny)\s*\d[\d,.]*)`;
   const valueLanguage = String.raw`(?:\b(?:prices?|priced|costs?|fees?|payment|purchase|buy|sale|sold|included)\b|\bfor\s+sale\b|\b(?:valued|worth)\s+(?:at\s+)?${currencyAmount}|${currencyAmount})`;
-  const spiritualBenefit = String.raw`(?:blessing|grace|indulgence|spiritual\s+(?:benefit|effect))`;
+  // Pairing any of these non-transferable spiritual effects or ministries with
+  // price/value language is a deterministic hard block. Keep physical goods
+  // such as a "prayer card" out of this vocabulary so ordinary merchandise is
+  // not swept in merely because its name contains a devotional word.
+  const spiritualBenefit = String.raw`(?:blessing|grace|indulgence|spiritual\s+(?:benefit|effect|healing|protection)|healing(?:\s+(?:benefit|effect|power))?|miracles?(?:\s+prayer)?|divine\s+protection|protection\s+(?:from|against)\b[^.\n]{0,30}|answered\s+prayers?|prayer\s+(?:service|intention)|mass\s+intention)`;
   const relicClassOrdinal = String.raw`(?:first|second|third|1st|2nd|3rd)[ \t\-‐‑‒–—]+class`;
   const classClaimObject = String.raw`(?:relics?|rosar(?:y|ies)|medals?|cross(?:es)?|crucifix(?:es)?|pendants?|scapulars?|cloth|clothing|garments?|bones?|blood|hair|teeth|tooth|tissue|fragments?|particles?|remains?|sacramentals?|devotional\s+objects?|items?)`;
   const explicitRelicClass = new RegExp(String.raw`(?:\b${relicClassOrdinal}\b[ \t,:-]{0,12}\b${classClaimObject}\b|\b${classClaimObject}\b[^.\n]{0,20}\b${relicClassOrdinal}\b)`, 'i');
@@ -151,8 +156,15 @@ function savedCopyFlags(listingCopy) {
   // Require matter/provenance wording before treating the saved copy as an
   // explicit sale claim so ordinary replica artwork is not swept in.
   const explicitNamedRelic = /\b(?:piece|wood|fragment|splinter|particle|portion)\s+(?:of|from)\s+(?:the\s+)?(?:true\s+cross|crown\s+of\s+thorns)\b|\b(?:piece|fragment|splinter|particle|portion)\s+(?:of|from)\s+(?:an?\s+)?holy\s+nail\b|\b(?:authentic|genuine|actual|original)\s+holy\s+nail\b|\bholy\s+nail\s+from\s+(?:the\s+)?(?:crucifixion|passion)\b/i;
+  // A tightly scoped denial such as "No relic status is claimed" is not an
+  // affirmative relic-sale claim. Remove only complete denial formulations;
+  // any additional affirmative mention remains and is still blocked.
+  const relicClaimText = text.replace(
+    /\b(?:no\s+(?:sacred\s+)?relic(?:s|\s+status)?\s+(?:is|are)\s+(?:claimed|asserted|represented)|not\s+(?:a|an)\s+(?:sacred\s+)?relic|without\s+(?:a|an|any)\s+(?:sacred\s+)?relics?)\b/gi,
+    ''
+  );
   if (
-    /\brelics?\b|\bex\s+(?:ossibus|capillis|sanguine|carne|corpore|praecordiis|pulveribus|indumentis|vestimentis|brandea|linteo)\b/i.test(text) ||
+    /\brelics?\b|\bex\s+(?:ossibus|capillis|sanguine|carne|corpore|praecordiis|pulveribus|indumentis|vestimentis|brandea|linteo)\b/i.test(relicClaimText) ||
     /\b(?:first|second|third)[ -]class\b[^.\n]{0,60}\b(?:fragment|particle|remains?)\b/i.test(text) ||
     /\b(?:mortal\s+remains?|fragments?|particles?|bones?|hair|blood|teeth|tooth|tissue)\b[^.\n]{0,40}\b(?:of|from)\s+(?:st\.?|saint|blessed)\b/i.test(text) ||
     /\b(?:st\.?|saint|blessed)\s+[a-z][a-z.' -]{0,50}\b(?:fragments?|particles?|remains?|bones?|hair|blood|teeth|tooth|tissue)\b/i.test(text) ||
@@ -478,9 +490,26 @@ export async function saveHumanReview(database, input, actor) {
   const note = typeof value.note === 'string' ? value.note.trim() : '';
   if (note.length < 8) throw new HttpError(400, 'A meaningful review note is required');
   if (note.length > 4000) throw new HttpError(400, 'Review note is too long');
-  const assessment = await database.prepare('SELECT id,artwork_id,revision_id,policy_version,decision FROM catalog_compliance_assessments WHERE id=?').bind(value.assessment_id).first();
+  const assessment = await database.prepare(`SELECT a.id,a.artwork_id,a.revision_id,a.policy_version,a.decision,
+    (SELECT p.id FROM catalog_policy_versions p WHERE p.status='active' ORDER BY p.activated_at DESC,p.id DESC LIMIT 1) AS active_policy_id,
+    (SELECT a2.id FROM catalog_compliance_assessments a2 WHERE a2.revision_id=a.revision_id AND a2.policy_version=a.policy_version
+      ORDER BY a2.created_at DESC,a2.rowid DESC LIMIT 1) AS latest_assessment_id
+    FROM catalog_compliance_assessments a WHERE a.id=?`).bind(value.assessment_id).first();
   if (!assessment) throw new HttpError(404, 'Assessment not found');
+  if (assessment.policy_version !== assessment.active_policy_id) {
+    throw new HttpError(409, 'The active listing policy changed; review the listing under the new policy', {code: 'POLICY_CHANGED'});
+  }
+  if (assessment.id !== assessment.latest_assessment_id) {
+    throw new HttpError(409, 'Assessment has been superseded; review the latest assessment', {code: 'ASSESSMENT_SUPERSEDED'});
+  }
   if (value.decision === 'approve' && assessment.decision !== 'review') throw new HttpError(409, 'A hard block or completed allowance cannot be human-approved');
+  if (value.decision === 'approve') {
+    const history = await listReviewEscalations(database, assessment.id);
+    const latest = history.at(-1);
+    if (!latest || !['local_priest', 'diocesan_chancery'].includes(latest.stage) || latest.outcome !== 'cleared') {
+      throw new HttpError(409, 'Record a cleared local-priest or diocesan consultation before approval', {code: 'PRIEST_CLEARANCE_REQUIRED'});
+    }
+  }
   const id = opaqueId(value.id);
   const statements = [
     database.prepare('INSERT INTO catalog_review_decisions(id,assessment_id,decision,note,actor) VALUES(?,?,?,?,?)')
@@ -497,6 +526,9 @@ export async function saveHumanReview(database, input, actor) {
     }
     if (String(error?.message || error).includes('ASSESSMENT_SUPERSEDED')) {
       throw new HttpError(409, 'Assessment has been superseded; review the latest assessment', {code: 'ASSESSMENT_SUPERSEDED'});
+    }
+    if (String(error?.message || error).includes('PRIEST_CLEARANCE_REQUIRED')) {
+      throw new HttpError(409, 'Record a cleared local-priest or diocesan consultation before approval', {code: 'PRIEST_CLEARANCE_REQUIRED'});
     }
     throw error;
   }
